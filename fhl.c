@@ -14,12 +14,14 @@
  * matches from the output, with wide over-copies for the leading nfast
  * commands (counted by the encoder) for which those stay in bounds.
  *
- *   fhl c [-K k] [-p passes] [-d depth] [-f] [-j threads] in out   compress (and verify)
+ *   fhl c [-K k] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out
+ *                                               compress (and verify)
  *   fhl d in out                                 decompress
  *
- * K only enters through the literal prices, so -f prices and emits every
- * K = 1..16 from a single parse (about two thirds of the single-threaded
- * encode time, up to 0.05% larger); the default re-parses for each K.
+ * K only enters through the literal prices, so -f prices every K = 1..16
+ * from a single parse and writes the one with the fewest estimated literal
+ * bits; the default re-parses for each K. -t swaps the hash chains for a
+ * binary tree and -g the flat-priced first parse for a greedy one.
  *
  * Stream: u32 size | u8 K | u32 nlit | u32 nfast | u32 offsets of literal
  * streams A and B and of the distance stream | map | meta lengths | code
@@ -1341,7 +1343,7 @@ int main(int argc, char **argv)
 				"  -t  binary-tree match finder (serial; faster on one core, finds more)\n"
 				"  -g  seed the prices with a greedy parse instead of a flat-priced one\n"
 				"  -f  price every K from one parse and write the most promising\n"
-				"  fastest: -t -g -f; each costs at most a few hundredths of a percent\n");
+				"  -t -g -f together: about 2.5x faster for about 0.1%% larger\n");
 		return 1;
 	}
 	size_t n, on;

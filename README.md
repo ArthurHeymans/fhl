@@ -80,11 +80,15 @@ with Huffman prices from the first parse's statistics (more iterations made
 the streams larger). It k-means-clusters the 256 contexts into K tables. The
 flat parse is the same for every K, so it runs once; by default each K then
 gets its own priced parse on its own thread, and the smallest stream wins;
-`-K` picks one. K only enters through the literal prices, so `-f` prices all
-of K = 1..16 from one parse (priced with PARSE_K = 4 tables) and emits each
-from it in parallel: about two thirds of the single-threaded encode time
-for up to 0.05% larger streams. The match finder searches on `-j` threads
-too, with the same matches for any thread count.
+`-K` picks one. The match finder walks hash chains on `-j` threads, with the
+same matches for any thread count. Three options trade a little size for
+time, together about as fast as `zstd -19`:
+
+- `-t` searches a binary tree per hash (as LZMA's bt) instead of chains:
+  serial, but faster on one core and it finds better matches.
+- `-g` seeds the prices with a lazy greedy parse instead of the flat one.
+- `-f` prices every K from one parse (priced with PARSE_K = 4 tables) and
+  writes only the K whose literals estimate smallest.
 
 ## Use
 
@@ -97,7 +101,7 @@ size_t n = fhl_decode(src, src_len, dst, dst_cap, work);   /* 0 on a bad header 
 Build with `-DFHL_DECODER_ONLY` to get just `fhl_decode()`.
 
 ```
-make            # fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-f] [-j threads] in out
+make            # fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out
 make test       # round trips under ASan/UBSan
 ```
 
@@ -114,18 +118,23 @@ thread.
 | **fhl**, 1 thread | 6.4 | 6.9 | 3.6 |
 | **fhl**, 5 threads | 3.0 | 3.1 | 1.5 |
 
-That table predates the current encoder. Rerun on the Ryzen 9 8945HS: the
-default writes the same streams byte for byte (1,716,520 B), `-f` costs
-0.05% (1,717,367 B):
+That table predates the current encoder. Rerun on the Ryzen 9 8945HS, gcc
+-O2; the default writes the same streams byte for byte:
 
-| encoder | gcc -O2 | clang -O2 |
+| encoder | time | bytes |
 |---|---:|---:|
-| `fhl`, 1 thread (before) | 3.81 s | 3.16 s |
-| `fhl`, 1 thread | **1.52 s** | **1.48 s** |
-| `fhl -f`, 1 thread | 1.05 s | 1.03 s |
-| `fhl`, 5 threads (before) | 1.51 s | 1.36 s |
-| `fhl`, 5 threads | **0.76 s** | **0.72 s** |
-| `fhl -f`, 5 threads | 0.64 s | 0.61 s |
+| zstd -19 | 0.56 s | 1,665,631 |
+| xz `--format=lzma -9e` | 1.56 s | 1,565,605 |
+| `fhl`, 1 thread (before) | 3.81 s | 1,716,520 |
+| `fhl`, 1 thread | 1.43 s | 1,716,520 |
+| `fhl`, 5 threads (before) | 1.51 s | 1,716,520 |
+| `fhl`, 5 threads | 0.75 s | 1,716,520 |
+| `fhl -t`, 1 thread | 1.19 s | 1,714,883 (-0.10%) |
+| `fhl -t -f`, 1 thread | 0.67 s | 1,715,903 (-0.04%) |
+| `fhl -t -g -f`, 1 thread | **0.58 s** | 1,717,830 (+0.08%) |
+| `fhl -t -g -f -d 16`, 1 thread | 0.54 s | 1,719,673 (+0.18%) |
+
+`-t` is serial, so threads barely help the last rows.
 
 ## Limitations
 
