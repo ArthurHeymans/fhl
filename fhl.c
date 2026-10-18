@@ -14,7 +14,7 @@
  * matches from the output, with wide over-copies for the leading nfast
  * commands (counted by the encoder) for which those stay in bounds.
  *
- *   fhl c [-K k] [-p passes] [-d depth] in out   compress (and verify)
+ *   fhl c [-K k] [-p passes] [-d depth] [-j threads] in out   compress (and verify)
  *   fhl d in out                                 decompress
  *
  * Stream: u32 size | u8 K | u32 nlit | u32 nfast | u32 offsets of literal
@@ -29,6 +29,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fhl.h"
+#ifndef FHL_DECODER_ONLY
+#include <pthread.h>
+#endif
 
 #ifndef MAXL
 #define MAXL 10                     /* max Huffman code length = LUT bits; 10 keeps K tables in L1 */
@@ -363,6 +366,7 @@ static unsigned ml_code(uint32_t M) { int c = 15; while (c && M < ml_base[c]) c-
 
 struct model {
 	unsigned K, Kf;
+	int legacy;     /* ANZ pricing, see fhl_parse() */
 	uint8_t map[256], mapf[256];
 };
 
@@ -432,18 +436,13 @@ static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, struct m
 	free(head); free(prv);
 }
 
-/* fhl_parse() for ANZ prices literals with ANZ's context instead: the
- * previous output byte, and with Kf > 0 the match byte for the first literal
- * after a match */
-static int legacy;
-
 /* literal table index at position pos; plit holds the last two literals.
  * FHL's context is the literal two back: each literal stream then only
  * depends on itself. */
 static inline unsigned lctx(const struct model *md, const uint8_t *in, uint32_t pos, int first,
 			    uint32_t rep0, unsigned plit)
 {
-	if (!legacy) return md->map[plit >> 8];
+	if (!md->legacy) return md->map[plit >> 8];
 	if (first && md->Kf) return md->K + md->mapf[in[pos - rep0]];
 	return md->map[pos ? in[pos - 1] : 0];
 }
@@ -528,7 +527,7 @@ static size_t parse(const uint8_t *in, uint32_t n, const struct mf *m, const str
 }
 
 /* Walk a parse; callback-free: fills prev-byte and match-byte literal histograms. */
-static void stats(const uint8_t *in, const struct seq *s, size_t ns, uint32_t (*pf)[256],
+static void stats(const uint8_t *in, const struct seq *s, size_t ns, int legacy, uint32_t (*pf)[256],
 		  uint32_t (*ff)[256], uint32_t *cf, uint32_t *df)
 {
 	uint32_t pos = 0, rep0 = 1;
@@ -553,9 +552,9 @@ static void cluster(uint32_t (*pf)[256], unsigned K, uint8_t *map)
 {
 	for (unsigned p = 0; p < 256; p++) map[p] = (uint8_t)((p * K) >> 8);
 	if (K <= 1) { memset(map, 0, 256); return; }
-	static double cl[MAXT][256], sum[MAXT][256];
+	double (*cl)[256] = malloc(sizeof(double[MAXT][256])), (*sum)[256] = malloc(sizeof(double[MAXT][256]));
 	for (int it = 0; it < 30; it++) {
-		memset(sum, 0, sizeof(sum));
+		memset(sum, 0, sizeof(double[MAXT][256]));
 		for (unsigned p = 0; p < 256; p++)
 			for (unsigned s = 0; s < 256; s++) sum[map[p]][s] += pf[p][s];
 		for (unsigned k = 0; k < K; k++) {
@@ -575,11 +574,12 @@ static void cluster(uint32_t (*pf)[256], unsigned K, uint8_t *map)
 		}
 		if (!changed) break;
 	}
+	free(cl); free(sum);
 }
 
 static void write_lengths(struct bw *w, const uint8_t *len, unsigned total)
 {
-	static uint16_t sy[NLEN], ex[NLEN];
+	uint16_t *sy = malloc(2 * NLEN), *ex = malloc(2 * NLEN);
 	unsigned ns = 0, prev = 0;
 	for (unsigned i = 0; i < total;) {
 		unsigned l = len[i], r = 1;
@@ -607,23 +607,23 @@ static void write_lengths(struct bw *w, const uint8_t *len, unsigned total)
 		else if (sy[i] == 13) put(w, ex[i], 3);
 		else if (sy[i] == 14) put(w, ex[i], 7);
 	}
+	free(sy); free(ex);
 }
 
 /* Build code lengths for a parse under a model. */
 static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
 			  uint8_t *len)
 {
-	static uint32_t pf[256][256], ff[256][256], lf[MAXT][256], cf[NCMD], df[NDIST];
-	memset(pf, 0, sizeof(pf)); memset(ff, 0, sizeof(ff)); memset(lf, 0, sizeof(lf));
-	memset(cf, 0, sizeof(cf)); memset(df, 0, sizeof(df));
-	stats(in, s, ns, pf, ff, cf, df);
+	uint32_t (*pf)[256] = calloc(256, sizeof(*pf)), (*ff)[256] = calloc(256, sizeof(*ff));
+	uint32_t (*lf)[256] = calloc(MAXT, sizeof(*lf)), cf[NCMD] = {0}, df[NDIST] = {0};
+	stats(in, s, ns, md->legacy, pf, ff, cf, df);
 	for (unsigned q = 0; q < 256; q++)
 		for (unsigned x = 0; x < 256; x++) {
 			lf[md->map[q]][x] += pf[q][x];
 			if (md->Kf) lf[md->K + md->mapf[q]][x] += ff[q][x];
 			else lf[md->map[0]][x] += 0;   /* first literals then use the prev-byte map */
 		}
-	if (!md->Kf && legacy) {
+	if (!md->Kf && md->legacy) {
 		/* without Kf the first literal is coded by the prev-byte map: recount */
 		uint32_t pos = 0;
 		for (size_t i = 0; i < ns; i++) {
@@ -635,6 +635,7 @@ static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, con
 	for (unsigned k = 0; k < T; k++) huff_len(lf[k], NLIT, MAXL, len + k * NLIT);
 	huff_len(cf, NCMD, MAXL, len + T * NLIT);
 	huff_len(df, NDIST, MAXL, len + T * NLIT + NCMD);
+	free(pf); free(ff); free(lf);
 }
 
 static void wr32(uint8_t *p, uint32_t v)
@@ -650,8 +651,9 @@ static void flush(struct bw *w)
 static size_t emit(const uint8_t *in, uint32_t n, const struct seq *s, size_t ns,
 		   const struct model *md, uint8_t *out)
 {
-	static uint8_t len[NLEN], sb[3][1 << 22];
-	static uint32_t code[NLEN];
+	uint8_t *len = malloc(NLEN), *sb[3];
+	uint32_t *code = malloc(4 * NLEN);
+	for (int q = 0; q < 3; q++) sb[q] = malloc((size_t)n * 2 + 1024);
 	unsigned K = md->K, kb = log2k(K);
 	model_lengths(in, s, ns, md, len);
 	uint32_t nl = 0, nf = 0;
@@ -708,19 +710,22 @@ static size_t emit(const uint8_t *in, uint32_t n, const struct seq *s, size_t ns
 		flush(&ws[q]);
 		memcpy(w.p, sb[q], (size_t)(ws[q].p - sb[q]));
 		w.p += ws[q].p - sb[q];
+		free(sb[q]);
 	}
+	free(len); free(code);
 	return (size_t)(w.p - out);
 }
 
 static void costs_from(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
 		       struct cost *c)
 {
-	static uint8_t len[NLEN];
+	uint8_t *len = malloc(NLEN);
 	unsigned T = md->K + md->Kf;
 	model_lengths(in, s, ns, md, len);
 	for (unsigned k = 0; k < T; k++) lens_to_cost(len + k * NLIT, NLIT, c->lit[k], 13);
 	lens_to_cost(len + T * NLIT, NCMD, c->cmd, 13);
 	lens_to_cost(len + T * NLIT + NCMD, NDIST, c->dist, 13);
+	free(len);
 }
 
 /* Iterate parse -> statistics -> prices; returns the final parse length. */
@@ -732,55 +737,94 @@ static size_t parse_iter(const uint8_t *in, uint32_t n, const struct mf *m, stru
 	for (unsigned x = 0; x < 256; x++) c->cmd[x] = 6 * 16;
 	for (unsigned x = 0; x < NDIST; x++) c->dist[x] = 5 * 16;
 	size_t ns = 0;
-	static uint32_t pf[256][256], ff[256][256], cf[NCMD], df[NDIST];
+	uint32_t (*pf)[256] = malloc(256 * sizeof(*pf)), (*ff)[256] = malloc(256 * sizeof(*ff));
+	uint32_t cf[NCMD], df[NDIST];
 	for (int p = 0; p < passes; p++) {
 		ns = parse(in, n, m, md, c, s);
-		memset(pf, 0, sizeof(pf)); memset(ff, 0, sizeof(ff));
+		memset(pf, 0, 256 * sizeof(*pf)); memset(ff, 0, 256 * sizeof(*ff));
 		memset(cf, 0, sizeof(cf)); memset(df, 0, sizeof(df));
-		stats(in, s, ns, pf, ff, cf, df);
+		stats(in, s, ns, md->legacy, pf, ff, cf, df);
 		cluster(pf, md->K, md->map);
 		cluster(ff, md->Kf, md->mapf);
 		costs_from(in, s, ns, md, c);
 	}
 	ns = parse(in, n, m, md, c, s);
-	free(c);
+	free(c); free(pf); free(ff);
 	return ns;
 }
 
-/* Best stream over K = 1..16 (or just Kreq); returns its size. */
+/* One K setting of compress(), run on its own thread. */
+struct job {
+	const uint8_t *in;
+	uint32_t n;
+	const struct mf *m;
+	unsigned K;
+	int passes;
+	uint8_t *out;
+	size_t size;
+};
+static void *run_job(void *arg)
+{
+	struct job *j = arg;
+	struct model md = { .K = j->K };
+	struct seq *s = malloc(sizeof(*s) * ((size_t)j->n + 2));
+	size_t ns = parse_iter(j->in, j->n, j->m, &md, j->passes, s);
+	j->out = malloc((size_t)j->n * 2 + 65536);
+	j->size = emit(j->in, j->n, s, ns, &md, j->out);
+	free(s);
+	return NULL;
+}
+
+/* Smallest stream over K = 1..16 (or just Kreq), up to 'threads' K at a
+ * time; ties go to the smaller K. Returns its size. */
 __attribute__((unused))
-static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, int passes, unsigned depth)
+static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, int passes,
+		       unsigned depth, unsigned threads)
 {
 	struct mf m;
 	find_matches(in, n, depth, &m);
-	struct seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
-	uint8_t *tmp = malloc((size_t)n * 2 + 65536);
-	size_t best = (size_t)-1;
-	for (unsigned K = 1; K <= MAXK; K *= 2) {
-		if (Kreq > 0 && K != (unsigned)Kreq) continue;
-		struct model md = { .K = K };
-		size_t ns = parse_iter(in, n, &m, &md, passes, s);
-		size_t sz = emit(in, n, s, ns, &md, tmp);
-		if (sz < best) { best = sz; memcpy(out, tmp, sz); }
+	struct job jobs[5];
+	pthread_t tid[5];
+	unsigned nj = 0;
+	for (unsigned K = 1; K <= MAXK; K *= 2)
+		if (Kreq <= 0 || K == (unsigned)Kreq)
+			jobs[nj++] = (struct job){ in, n, &m, K, passes, NULL, 0 };
+	for (unsigned a = 0; a < nj; a += threads) {
+		unsigned b = a + threads < nj ? a + threads : nj;
+		for (unsigned k = a + 1; k < b; k++) pthread_create(&tid[k], NULL, run_job, &jobs[k]);
+		run_job(&jobs[a]);
+		for (unsigned k = a + 1; k < b; k++) pthread_join(tid[k], NULL);
 	}
-	free(s); free(tmp); free(m.c); free(m.off);
-	return best;
+	size_t best = 0;
+	for (unsigned k = 1; k < nj; k++) best = jobs[k].size < jobs[best].size ? k : best;
+	size_t sz = jobs[best].size;
+	memcpy(out, jobs[best].out, sz);
+	for (unsigned k = 0; k < nj; k++) free(jobs[k].out);
+	free(m.c); free(m.off);
+	return sz;
 }
 
-/* The parser for ANZ (github.com/ArthurHeymans/anz): an FHL parse priced with
- * ANZ's literal context, K previous-byte tables and Kf match-byte tables.
- * out needs n + 2 entries; returns the number of commands, the last of which
- * has M == 0 (literals only). */
-size_t fhl_parse(const uint8_t *in, uint32_t n, unsigned K, unsigned Kf, struct fhl_seq *out)
+/* The parser for ANZ (github.com/ArthurHeymans/anz). fhl_matches() runs the
+ * match finder once; fhl_parse() is then thread-safe and gives an FHL parse
+ * priced with ANZ's literal context: K previous-byte tables and Kf
+ * match-byte tables, four passes. out needs n + 2 entries; returns the
+ * number of commands, the last of which has M == 0 (literals only). */
+struct fhl_mf { struct mf m; };
+struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
 {
-	struct mf m;
-	find_matches(in, n, 256, &m);
-	struct model md = { .K = K, .Kf = Kf };
-	legacy = 1;
-	size_t ns = parse_iter(in, n, &m, &md, 4, out);
-	legacy = 0;
-	free(m.c); free(m.off);
-	return ns;
+	struct fhl_mf *f = malloc(sizeof(*f));
+	find_matches(in, n, 256, &f->m);
+	return f;
+}
+void fhl_matches_free(struct fhl_mf *f)
+{
+	free(f->m.c); free(f->m.off); free(f);
+}
+size_t fhl_parse(const uint8_t *in, uint32_t n, const struct fhl_mf *f, unsigned K, unsigned Kf,
+		 struct fhl_seq *out)
+{
+	struct model md = { .K = K, .Kf = Kf, .legacy = 1 };
+	return parse_iter(in, n, &f->m, &md, 4, out);
 }
 
 #ifndef FHL_LIB
@@ -799,18 +843,19 @@ static uint8_t *slurp(const char *path, size_t *n)
 
 int main(int argc, char **argv)
 {
-	int K = 0, passes = 4;
-	unsigned depth = 256;
+	int K = 0, passes = 1;
+	unsigned depth = 256, threads = 5;
 	int a = 2;
 	while (a + 1 < argc && argv[a][0] == '-') {
 		if (!strcmp(argv[a], "-K")) K = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-p")) passes = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-d")) depth = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-j")) threads = (unsigned)atoi(argv[++a]);
 		a++;
 	}
 	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') ||
-	    (K && (K > MAXK || (K & (K - 1))))) {
-		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] in out\n"
+	    (K && (K > MAXK || (K & (K - 1)))) || threads < 1) {
+		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-j threads] in out\n"
 				"       fhl d in out\n");
 		return 1;
 	}
@@ -820,7 +865,7 @@ int main(int argc, char **argv)
 	if (argv[1][0] == 'c') {
 		if (n > 0xffffffffu) { fprintf(stderr, "%s: too large\n", argv[a]); return 1; }
 		out = malloc(n * 2 + 65536);
-		on = compress(in, (uint32_t)n, out, K, passes, depth);
+		on = compress(in, (uint32_t)n, out, K, passes, depth, threads);
 		uint8_t *chk = malloc(n + 1);
 		if (fhl_decode(out, on, chk, n, &t) != n || memcmp(chk, in, n)) {
 			fprintf(stderr, "%s: verify failed\n", argv[a]);

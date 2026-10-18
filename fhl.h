@@ -21,6 +21,10 @@ size_t fhl_decode(const void *src, size_t n, void *dst, size_t cap, void *work);
 
 /* Encoder-side parser used by ANZ; see fhl.c. */
 struct fhl_seq { uint32_t L, M, ds, d; };
-size_t fhl_parse(const uint8_t *in, uint32_t n, unsigned K, unsigned Kf, struct fhl_seq *out);
+struct fhl_mf;
+struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n);
+void fhl_matches_free(struct fhl_mf *m);
+size_t fhl_parse(const uint8_t *in, uint32_t n, const struct fhl_mf *m, unsigned K, unsigned Kf,
+		 struct fhl_seq *out);
 
 #endif

@@ -4,10 +4,10 @@ CFLAGS ?= -O2 -Wall -Wextra
 all: fhl
 
 fhl: fhl.c fhl.h
-	$(CC) $(CFLAGS) -o $@ fhl.c -lm
+	$(CC) $(CFLAGS) -pthread -o $@ fhl.c -lm
 
 fhl-asan: fhl.c fhl.h
-	$(CC) -O1 -g -fsanitize=address,undefined -o $@ fhl.c -lm
+	$(CC) -O1 -g -fsanitize=address,undefined -pthread -o $@ fhl.c -lm
 
 test: fhl-asan
 	./tests/run.sh ./fhl-asan

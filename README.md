@@ -14,12 +14,12 @@ at x86-64 `-Os`.
 | codec | bytes | vs LZSA2 | decode | decoder | RAM |
 |---|---:|---:|---:|---:|---:|
 | LZMA (coreboot, lc3) | 1,565,241 | −12.8% | 101.0 ms | 3.6 KB | 16 KB |
-| [ANZ](https://github.com/ArthurHeymans/anz) | 1,581,693 | −11.9% | 60.0 ms | 2.9 KB | 83 KB |
+| [ANZ](https://github.com/ArthurHeymans/anz) | 1,581,767 | −11.9% | 59.7 ms | 2.9 KB | 83 KB |
 | zstd -19 (coreboot decoder) | 1,665,519 | −7.2% | 6.6 ms | 41 KB | 96 KB |
-| **FHL** | 1,718,463 | −4.3% | 5.8 ms | 3.5 KB | 45 KB |
-| **FHL `-K 1`** | 1,723,647 | −4.0% | **5.5 ms** | 3.5 KB | 45 KB (10 KB used) |
-| LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.4 ms | 1.9 KB | 0 |
-| LZSA2, upstream lzsa | 1,795,384 | 0 | 7.1 ms | 1.1 KB | 0 |
+| **FHL** | 1,716,520 | −4.4% | 5.7 ms | 3.5 KB | 45 KB |
+| **FHL `-K 1`** | 1,722,404 | −4.1% | **5.5 ms** | 3.5 KB | 45 KB (10 KB used) |
+| LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.3 ms | 1.9 KB | 0 |
+| LZSA2, upstream lzsa | 1,795,384 | 0 | 7.0 ms | 1.1 KB | 0 |
 
 I also modelled boot-time load cost as flash read time plus decode time,
 with the decoder's own code read from flash once per board. In that model FHL
@@ -74,9 +74,10 @@ All multi-byte fields are little-endian, and bitstreams are LSB-first.
   `((2 | s&1) << nb) + extra + 1` with `nb = s/2 - 1` raw extra bits.
 - Every stream is followed by 8 zero bytes.
 
-The encoder uses forward optimal parsing with Huffman prices, iterated four
-times. It k-means-clusters the 256 contexts into K tables and keeps the
-smallest K (or uses `-K`).
+The encoder runs a forward optimal parse twice: first with flat prices, then
+with Huffman prices from the first parse's statistics (more iterations made
+the streams larger). It k-means-clusters the 256 contexts into K tables. It
+tries each K on its own thread and keeps the smallest stream; `-K` picks one.
 
 ## Use
 
@@ -89,12 +90,14 @@ size_t n = fhl_decode(src, src_len, dst, dst_cap, work);   /* 0 on a bad header 
 Build with `-DFHL_DECODER_ONLY` to get just `fhl_decode()`.
 
 ```
-make            # fhl c [-K 1|2|4|8|16] [-p passes] in out ; fhl d in out
+make            # fhl c [-K 1|2|4|8|16] [-p passes] [-j threads] in out ; fhl d in out
 make test       # round trips under ASan/UBSan
 ```
 
-The encoder verifies every stream it writes. It runs at about 0.5 MB/s
-(2 MB/s with `-K 1`) and uses about 70 bytes of RAM per input byte.
+The encoder verifies every stream it writes. On one Ryzen 8945HS core it
+compresses 1.2 MB/s, or 3.4 MB/s with `-K 1`. With the default five threads
+it reaches 2.7 MB/s. It uses about 70 bytes of RAM per input byte per
+thread.
 
 ## Limitations
 
