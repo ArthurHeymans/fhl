@@ -23,8 +23,9 @@ size_t fhl_decode(const void *src, size_t n, void *dst, size_t cap, void *work);
 struct fhl_seq { uint32_t L, M, ds, d; };
 struct fhl_mf;
 struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n);
-/* Same, with the hash-chain search depth (fhl_matches uses 256). */
-struct fhl_mf *fhl_matches_depth(const uint8_t *in, uint32_t n, unsigned depth);
+/* Same, with the hash-chain search depth (fhl_matches uses 256) and
+ * searching on up to 'threads' threads (the same matches for any count). */
+struct fhl_mf *fhl_matches_mt(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads);
 void fhl_matches_free(struct fhl_mf *m);
 size_t fhl_parse(const uint8_t *in, uint32_t n, const struct fhl_mf *m, unsigned K, unsigned Kf,
 		 struct fhl_seq *out);

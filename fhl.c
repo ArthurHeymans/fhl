@@ -450,43 +450,138 @@ static uint32_t mlen(const uint8_t *a, const uint8_t *b, uint32_t max)
 #define MAXM (264 + 65535)
 #define NICE 1024
 #define MAXD (1u << 20)
-static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, struct mf *m)
+/* Match finder: hash chains over 3 bytes, every candidate longer than the
+ * ones before it, nearest first. Inside a match of NICE or more only its
+ * continuation is a candidate (the parser jumps over it anyway).
+ *
+ * The chains are built first, so each position's search is independent
+ * but for that long-match state, and runs on several threads by segment.
+ * A segment starts as if no long match were running; the boundary is then
+ * redone serially with the state the previous segment really ended in,
+ * until it agrees with the segment's own: the candidates are the serial
+ * ones, whatever the thread count. */
+struct cbuf { struct cand *c; size_t k, cap; };
+static inline void cpush(struct cbuf *b, uint32_t len, uint32_t dist)
+{
+	if (b->k == b->cap) { b->cap = b->cap * 2 + 1024; b->c = realloc(b->c, b->cap * sizeof(*b->c)); }
+	b->c[b->k++] = (struct cand){ len, dist };
+}
+struct run { uint32_t end, d; };     /* a match >= NICE covers i..end */
+static inline int run_on(struct run r, uint32_t i) { return r.end >= i + NICE; }
+
+/* Candidates of position i in state *r. */
+static void mf_pos(const uint8_t *in, uint32_t n, const uint32_t *prv, unsigned depth, uint32_t i,
+		   struct run *r, struct cbuf *b)
+{
+	if (i + 3 > n) return;
+	uint32_t j = prv[i], best = 2, max = n - i < MAXM ? n - i : MAXM;
+	if (run_on(*r, i)) {
+		cpush(b, r->end - i < max ? r->end - i : max, r->d);
+		return;
+	}
+	for (unsigned dd = 0; dd < depth && j != 0xffffffff; dd++, j = prv[j]) {
+		if (i - j > MAXD) break;
+		if (in[j + best] != in[i + best]) continue;
+		uint32_t l = mlen(in + i, in + j, max);
+		if (l > best) {
+			cpush(b, l, i - j);
+			best = l;
+			if (l >= NICE) *r = (struct run){ i + l, i - j };
+			if (l >= NICE || l == max) break;
+		}
+	}
+}
+
+struct mfseg {
+	const uint8_t *in;
+	const uint32_t *prv;
+	uint32_t n, a, b;
+	unsigned depth;
+	struct cbuf c;
+	uint32_t *off;                  /* b - a + 1 offsets into c */
+	struct { uint32_t i; struct run r; } *ev;   /* long matches started, by position */
+	size_t nev;
+};
+static void *mf_seg(void *arg)
+{
+	struct mfseg *g = arg;
+	struct run r = { 0, 0 };
+	size_t cap = 0;
+	for (uint32_t i = g->a; i < g->b; i++) {
+		g->off[i - g->a] = (uint32_t)g->c.k;
+		struct run r0 = r;
+		mf_pos(g->in, g->n, g->prv, g->depth, i, &r, &g->c);
+		if (r.end != r0.end) {
+			if (g->nev == cap) { cap = cap * 2 + 16; g->ev = realloc(g->ev, cap * sizeof(*g->ev)); }
+			g->ev[g->nev].i = i; g->ev[g->nev++].r = r;
+		}
+	}
+	g->off[g->b - g->a] = (uint32_t)g->c.k;
+	return NULL;
+}
+
+static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads, struct mf *m)
 {
 	enum { HB = 18 };
 	uint32_t *head = malloc(sizeof(uint32_t) << HB), *prv = malloc(4 * (size_t)n + 4);
 	memset(head, 0xff, sizeof(uint32_t) << HB);
-	size_t cap = (size_t)n * 4 + 1024, k = 0;
-	m->c = malloc(cap * sizeof(struct cand));
-	m->off = malloc(4 * ((size_t)n + 1));
-	uint32_t run_end = 0, run_d = 0;   /* a match >= NICE covers i..run_end */
-	for (uint32_t i = 0; i < n; i++) {
-		m->off[i] = (uint32_t)k;
-		if (i + 3 > n) continue;
+	for (uint32_t i = 0; i + 3 <= n; i++) {
 		uint32_t h = ((in[i] | in[i + 1] << 8 | in[i + 2] << 16) * 2654435761u) >> (32 - HB);
-		uint32_t j = head[h], best = 2, max = n - i < MAXM ? n - i : MAXM;
-		head[h] = i; prv[i] = j;
-		if (run_end >= i + NICE) {
-			/* inside a long match: its continuation is the only candidate
-			 * (the parser jumps over it anyway); no chain walk, no compare */
-			if (k + 1 >= cap) { cap *= 2; m->c = realloc(m->c, cap * sizeof(struct cand)); }
-			m->c[k].len = run_end - i < max ? run_end - i : max; m->c[k].dist = run_d; k++;
-			continue;
+		prv[i] = head[h]; head[h] = i;
+	}
+	free(head);
+	unsigned ns = threads < 1 ? 1 : threads > 16 ? 16 : threads;
+	if (n < 65536 * ns) ns = n / 65536 ? n / 65536 : 1;
+	struct mfseg g[16];
+	pthread_t tid[16];
+	for (unsigned t = 0; t < ns; t++) {
+		g[t] = (struct mfseg){ in, prv, n, (uint32_t)((uint64_t)n * t / ns),
+				       (uint32_t)((uint64_t)n * (t + 1) / ns), depth, { NULL, 0, 0 }, NULL, NULL, 0 };
+		g[t].off = malloc(4 * ((size_t)(g[t].b - g[t].a) + 1));
+	}
+	for (unsigned t = 1; t < ns; t++) pthread_create(&tid[t], NULL, mf_seg, &g[t]);
+	mf_seg(&g[0]);
+	for (unsigned t = 1; t < ns; t++) pthread_join(tid[t], NULL);
+
+	/* stitch: redo each segment's start in the state the one before ended in */
+	struct cbuf fix[16] = { { NULL, 0, 0 } };
+	uint32_t conv[16], *foff = malloc(4 * ((size_t)n + 1));
+	struct run r = { 0, 0 };
+	size_t total = 0;
+	for (unsigned t = 0; t < ns; t++) {
+		uint32_t i = g[t].a;
+		size_t e = 0;
+		struct run own = { 0, 0 };   /* the segment's state before i */
+		for (; i < g[t].b; i++) {
+			while (e < g[t].nev && g[t].ev[e].i < i) own = g[t].ev[e++].r;
+			if (run_on(r, i) ? run_on(own, i) && own.end == r.end && own.d == r.d : !run_on(own, i))
+				break;
+			foff[i] = (uint32_t)fix[t].k;
+			mf_pos(in, n, prv, depth, i, &r, &fix[t]);
 		}
-		for (unsigned dd = 0; dd < depth && j != 0xffffffff; dd++, j = prv[j]) {
-			if (i - j > MAXD) break;
-			if (in[j + best] != in[i + best]) continue;
-			uint32_t l = mlen(in + i, in + j, max);
-			if (l > best) {
-				if (k + 1 >= cap) { cap *= 2; m->c = realloc(m->c, cap * sizeof(struct cand)); }
-				m->c[k].len = l; m->c[k].dist = i - j; k++;
-				best = l;
-				if (l >= NICE) { run_end = i + l; run_d = i - j; }
-				if (l >= NICE || l == max) break;
-			}
+		conv[t] = i;
+		if (i < g[t].b) {
+			/* agreed from i on: the state at the end is the segment's */
+			r = (struct run){ 0, 0 };
+			for (e = 0; e < g[t].nev; e++) r = g[t].ev[e].r;
 		}
+		total += fix[t].k + (g[t].c.k - g[t].off[i - g[t].a]);
+	}
+	m->c = malloc((total + 1) * sizeof(struct cand));
+	m->off = malloc(4 * ((size_t)n + 1));
+	size_t k = 0;
+	for (unsigned t = 0; t < ns; t++) {
+		for (uint32_t i = g[t].a; i < conv[t]; i++) m->off[i] = (uint32_t)(k + foff[i]);
+		if (fix[t].k) memcpy(m->c + k, fix[t].c, fix[t].k * sizeof(struct cand));
+		k += fix[t].k;
+		uint32_t o0 = g[t].off[conv[t] - g[t].a];
+		for (uint32_t i = conv[t]; i < g[t].b; i++) m->off[i] = (uint32_t)(k + g[t].off[i - g[t].a] - o0);
+		if (g[t].c.k > o0) memcpy(m->c + k, g[t].c.c + o0, (g[t].c.k - o0) * sizeof(struct cand));
+		k += g[t].c.k - o0;
+		free(fix[t].c); free(g[t].c.c); free(g[t].off); free(g[t].ev);
 	}
 	m->off[n] = (uint32_t)k;
-	free(head); free(prv);
+	free(foff); free(prv);
 }
 
 /* literal table index at position pos; plit holds the last two literals.
@@ -962,7 +1057,7 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 		       unsigned depth, unsigned threads, int fast)
 {
 	struct mf m;
-	find_matches(in, n, depth, &m);
+	find_matches(in, n, depth, threads, &m);
 	struct model md = { .K = Kreq > 0 ? (unsigned)Kreq : PARSE_K };
 	struct seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
 	struct pws w;
@@ -1014,15 +1109,15 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
  * match-byte tables, four passes. out needs n + 2 entries; returns the
  * number of commands, the last of which has M == 0 (literals only). */
 struct fhl_mf { struct mf m; };
-struct fhl_mf *fhl_matches_depth(const uint8_t *in, uint32_t n, unsigned depth)
+struct fhl_mf *fhl_matches_mt(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads)
 {
 	struct fhl_mf *f = malloc(sizeof(*f));
-	find_matches(in, n, depth, &f->m);
+	find_matches(in, n, depth, threads, &f->m);
 	return f;
 }
 struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
 {
-	return fhl_matches_depth(in, n, 256);
+	return fhl_matches_mt(in, n, 256, 1);
 }
 void fhl_matches_free(struct fhl_mf *f)
 {
