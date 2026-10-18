@@ -7,19 +7,20 @@ than LZSA2, with a 3.5 KB decoder and no adaptive state.
 ## Numbers
 
 Corpus: 28 coreboot stages (romstage, ramstage and postcar from 10 boards),
-3,646,560 bytes. Decode time is the sum of per-stage medians on an Intel N100
-core, built with gcc `-O2 -march=x86-64-v2`. Decoder size is `.text + .rodata`
-at x86-64 `-Os`.
+3,646,560 bytes. Decode time is the sum of per-stage medians over 7 passes
+on one core, built with gcc `-O2 -march=x86-64-v2`. Decoder size is
+`.text + .rodata` at x86-64 `-Os`. The i5-8350U is a turbo laptop with
+another busy process, but two runs agreed within 3%.
 
-| codec | bytes | vs LZSA2 | decode | decoder | RAM |
-|---|---:|---:|---:|---:|---:|
-| LZMA (coreboot, lc3) | 1,565,241 | −12.8% | 101.0 ms | 3.6 KB | 16 KB |
-| [ANZ](https://github.com/ArthurHeymans/anz) | 1,581,767 | −11.9% | 59.7 ms | 2.9 KB | 83 KB |
-| zstd -19 (coreboot decoder) | 1,665,519 | −7.2% | 6.6 ms | 41 KB | 96 KB |
-| **FHL** | 1,716,520 | −4.4% | 5.7 ms | 3.5 KB | 45 KB |
-| **FHL `-K 1`** | 1,722,404 | −4.1% | **5.5 ms** | 3.5 KB | 45 KB (10 KB used) |
-| LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.3 ms | 1.9 KB | 0 |
-| LZSA2, upstream lzsa | 1,795,384 | 0 | 7.0 ms | 1.1 KB | 0 |
+| codec | bytes | vs LZSA2 | N100 | i5-8350U | decoder | RAM |
+|---|---:|---:|---:|---:|---:|---:|
+| LZMA (coreboot, lc3) | 1,565,241 | −12.8% | 101.1 ms | 104.2 ms | 3.6 KB | 16 KB |
+| [ANZ](https://github.com/ArthurHeymans/anz) | 1,581,767 | −11.9% | 59.9 ms | 70.3 ms | 2.9 KB | 83 KB |
+| zstd -19 (coreboot decoder) | 1,665,519 | −7.2% | 6.7 ms | 6.7 ms | 41 KB | 96 KB |
+| **FHL** | 1,716,520 | −4.4% | 5.8 ms | 6.6 ms | 3.5 KB | 45 KB |
+| **FHL `-K 1`** | 1,722,404 | −4.1% | **5.6 ms** | **6.4 ms** | 3.5 KB | 45 KB (10 KB used) |
+| LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.4 ms | 6.9 ms | 1.9 KB | 0 |
+| LZSA2, upstream lzsa | 1,795,384 | 0 | 7.1 ms | 7.9 ms | 1.1 KB | 0 |
 
 I also modelled boot-time load cost as flash read time plus decode time,
 with the decoder's own code read from flash once per board. In that model FHL
@@ -94,10 +95,18 @@ make            # fhl c [-K 1|2|4|8|16] [-p passes] [-j threads] in out ; fhl d 
 make test       # round trips under ASan/UBSan
 ```
 
-The encoder verifies every stream it writes. On one Ryzen 8945HS core it
-compresses 1.2 MB/s, or 3.4 MB/s with `-K 1`. With the default five threads
-it reaches 2.7 MB/s. It uses about 70 bytes of RAM per input byte per
+Encoding the corpus takes the following time in seconds. The encoders verify
+every stream they write. FHL uses about 70 bytes of RAM per input byte per
 thread.
+
+| encoder | N100 | i5-8350U | Ryzen 9 8945HS |
+|---|---:|---:|---:|
+| zstd -19 | 0.9 | 1.7 | 0.6 |
+| xz `--format=lzma -9e` | 2.0 | 3.1 | 1.5 |
+| upstream `lzsa -f 2` | 15.3 | 18.8 | 9.1 |
+| **fhl `-K 1`** | 1.9 | 2.6 | 1.2 |
+| **fhl**, 1 thread | 6.4 | 10.9 | 3.6 |
+| **fhl**, 5 threads | 3.0 | 3.5 | 1.5 |
 
 ## Limitations
 
