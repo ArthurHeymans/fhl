@@ -531,8 +531,56 @@ static void mf_one(struct mfseg *g)
 	g->off[g->b - g->a] = (uint32_t)g->c.k;
 }
 
-static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads, struct mf *m)
+/* Binary-tree match finder (as LZMA's bt), for -t: each position goes into
+ * a tree of the earlier positions with its 3-byte hash, ordered by what
+ * follows them, and the search walks at most 'depth' nodes of it. Serial,
+ * but it finds better matches than a chain of the same depth, faster. */
+static void find_matches_tree(const uint8_t *in, uint32_t n, unsigned depth, struct mf *m)
 {
+	enum { HB = 18 };
+	const uint32_t NIL = 0xffffffffu;
+	uint32_t *head = malloc(sizeof(uint32_t) << HB), *son = malloc(8 * ((size_t)n + 1));
+	memset(head, 0xff, sizeof(uint32_t) << HB);
+	struct cbuf b = { NULL, 0, 0 };
+	m->off = malloc(4 * ((size_t)n + 1));
+	struct run r = { 0, 0 };
+	for (uint32_t i = 0; i < n; i++) {
+		m->off[i] = (uint32_t)b.k;
+		if (i + 3 > n) continue;
+		uint32_t max = n - i < MAXM ? n - i : MAXM, nice = max < NICE ? max : NICE;
+		uint32_t h = ((in[i] | in[i + 1] << 8 | in[i + 2] << 16) * 2654435761u) >> (32 - HB);
+		int on = run_on(r, i);
+		if (on) cpush(&b, r.end - i < max ? r.end - i : max, r.d);
+		/* walk down from the root, hanging the smaller suffixes under
+		 * p1 and the larger under p0; len0/len1 are what the bounds
+		 * on each side are known to share with i */
+		uint32_t cur = head[h], *p0 = &son[2 * i + 1], *p1 = &son[2 * i], len0 = 0, len1 = 0, best = 2;
+		head[h] = i;
+		for (unsigned dd = 0;; dd++) {
+			if (cur == NIL || i - cur > MAXD || dd >= depth) { *p0 = *p1 = NIL; break; }
+			uint32_t len = len0 < len1 ? len0 : len1;
+			len += mlen(in + i + len, in + cur + len, nice - len);
+			if (len > best && !on) { best = len; cpush(&b, len, i - cur); }
+			if (len >= nice) { *p1 = son[2 * cur]; *p0 = son[2 * cur + 1]; break; }
+			if (in[cur + len] < in[i + len]) { *p1 = cur; p1 = &son[2 * cur + 1]; cur = *p1; len1 = len; }
+			else { *p0 = cur; p0 = &son[2 * cur]; cur = *p0; len0 = len; }
+		}
+		if (!on && best >= NICE) {
+			/* the tree compares up to NICE: measure the long one fully */
+			struct cand *c = &b.c[b.k - 1];
+			c->len = NICE + mlen(in + i + NICE, in + i - c->dist + NICE, max - NICE);
+			r = (struct run){ i + c->len, c->dist };
+		}
+	}
+	m->off[n] = (uint32_t)b.k;
+	m->c = b.c ? b.c : malloc(sizeof(struct cand));
+	free(head); free(son);
+}
+
+static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads, int tree,
+			 struct mf *m)
+{
+	if (tree) { find_matches_tree(in, n, depth, m); return; }
 	enum { HB = 18 };
 	uint32_t *head = malloc(sizeof(uint32_t) << HB), *prv = malloc(4 * (size_t)n + 4);
 	memset(head, 0xff, sizeof(uint32_t) << HB);
@@ -1022,6 +1070,37 @@ static size_t parse_flat(const uint8_t *in, uint32_t n, const struct mf *m, stru
 	return ns;
 }
 
+/* For -g, a lazy greedy parse instead: the longest match (a rep if it is
+ * nearly as long) unless the next position has a longer one. Cheaper than
+ * the flat-priced parse, and only seeds the prices. */
+static size_t parse_greedy(const uint8_t *in, uint32_t n, const struct mf *m, struct seq *s)
+{
+	uint32_t rep[3] = { 1, 1, 1 }, L = 0;
+	size_t k = 0;
+	for (uint32_t i = 0; i < n;) {
+		uint32_t max = n - i < MAXM ? n - i : MAXM, bl = 0, bd = 0, br = 3;
+		for (unsigned r = 0; r < 3; r++) {
+			if (rep[r] > i) continue;
+			uint32_t l = mlen(in + i, in + i - rep[r], max);
+			if (l > bl) { bl = l; br = r; }
+		}
+		uint32_t o = m->off[i + 1];
+		if (o > m->off[i] && m->c[o - 1].len > bl + 1) { bl = m->c[o - 1].len; bd = m->c[o - 1].dist; br = 3; }
+		if (bl < (br < 3 ? 2u : 3u) ||
+		    (br == 3 && i + 1 < n && m->off[i + 2] > m->off[i + 1] && m->c[m->off[i + 2] - 1].len > bl + 1)) {
+			L++; i++;
+			continue;
+		}
+		uint32_t d = br < 3 ? rep[br] : bd;
+		s[k++] = (struct seq){ L, bl, br < 3 ? br : 3 + dist_slot(d - 1), d };
+		if (br == 1) { rep[1] = rep[0]; rep[0] = d; }
+		else if (br != 0) { rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = d; }
+		L = 0; i += bl;
+	}
+	s[k] = (struct seq){ L, 0, 0, 0 };
+	return k + 1;
+}
+
 /* 'passes' rounds of statistics -> prices -> parse, starting from parse s
  * (ns commands), which is replaced by the final one; returns its length. h
  * is left with the histograms that priced it. */
@@ -1076,20 +1155,49 @@ static void *run_job(void *arg)
 	return NULL;
 }
 
-/* Smallest stream over K = 1..16 (or just Kreq), up to 'threads' K at a
- * time; ties go to the smaller K. 'fast' shares one parse between the K's.
- * Returns the size of the best stream. */
-__attribute__((unused))
-static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, int passes,
-		       unsigned depth, unsigned threads, int fast)
+/* Bits of the literals and their code lengths with K tables clustered from
+ * the histograms pf, leaving the maps in md: -f picks its K by this. */
+static uint64_t lit_bits(uint32_t (*pf)[256], struct model *md)
 {
+	cluster(pf, md->K, md->map);
+	uint32_t (*lf)[256] = calloc(MAXK, sizeof(*lf));
+	for (unsigned q = 0; q < 256; q++)
+		for (unsigned x = 0; x < 256; x++) lf[md->map[q]][x] += pf[q][x];
+	uint8_t *len = calloc(1, NLEN), *buf = malloc(MAXK * NLIT * 2 + 64);
+	uint64_t bits = 256 * log2k(md->K);
+	for (unsigned k = 0; k < md->K; k++) {
+		huff_len(lf[k], NLIT, MAXL, len + k * NLIT);
+		for (unsigned x = 0; x < NLIT; x++) bits += (uint64_t)lf[k][x] * len[k * NLIT + x];
+	}
+	struct bw w = { buf, 0, 0 };
+	write_lengths(&w, len, md->K * NLIT);
+	bits += 8 * (uint64_t)(w.p - buf) + w.cnt;
+	free(lf); free(len); free(buf);
+	return bits;
+}
+
+struct copts {
+	int K, passes;                  /* K 0: try 1..16 */
+	unsigned depth, threads;
+	int fast, tree, greedy;         /* -f, -t, -g */
+};
+
+/* Smallest stream over K = 1..16 (or just o->K), up to o->threads K at a
+ * time; ties go to the smaller K. With o->fast one parse serves every K
+ * and only the K with the fewest literal bits is written. Returns the size
+ * of the stream. */
+__attribute__((unused))
+static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, const struct copts *o)
+{
+	int Kreq = o->K, passes = o->passes, fast = o->fast;
+	unsigned threads = o->threads;
 	struct mf m;
-	find_matches(in, n, depth, threads, &m);
+	find_matches(in, n, o->depth, o->threads, o->tree, &m);
 	struct model md = { .K = Kreq > 0 ? (unsigned)Kreq : PARSE_K };
 	struct seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
 	struct pws w;
 	pws_alloc(&w, n);
-	size_t ns = parse_flat(in, n, &m, &w, s);
+	size_t ns = o->greedy ? parse_greedy(in, n, &m, s) : parse_flat(in, n, &m, &w, s);
 	struct hist h = { NULL, NULL };
 	if (fast) {
 		/* cluster every K from the histograms of the final parse */
@@ -1098,6 +1206,12 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 		uint32_t cf[NCMD] = {0}, df[NDIST] = {0};
 		memset(h.pf, 0, 256 * sizeof(*h.pf));
 		stats(in, s, ns, 0, h.pf, h.ff, cf, df);
+		uint64_t bb = ~0ull;
+		for (unsigned K = 1; K <= MAXK && o->K <= 0; K *= 2) {
+			struct model mk = { .K = K };
+			uint64_t e = lit_bits(h.pf, &mk);
+			if (e < bb) { bb = e; Kreq = (int)K; }
+		}
 	}
 	struct job jobs[5];
 	pthread_t tid[5];
@@ -1137,20 +1251,21 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
  * n + 2 entries; returns the number of commands, the last of which has
  * M == 0 (literals only). */
 struct fhl_mf { struct mf m; struct seq *flat; size_t nflat; };
-struct fhl_mf *fhl_matches_mt(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads)
+struct fhl_mf *fhl_matches_mt(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads,
+			      unsigned flags)
 {
 	struct fhl_mf *f = malloc(sizeof(*f));
 	struct pws w;
-	find_matches(in, n, depth, threads, &f->m);
+	find_matches(in, n, depth, threads, flags & FHL_MF_TREE, &f->m);
 	pws_alloc(&w, n);
 	f->flat = malloc(sizeof(*f->flat) * ((size_t)n + 2));
-	f->nflat = parse_flat(in, n, &f->m, &w, f->flat);
+	f->nflat = flags & FHL_MF_GREEDY ? parse_greedy(in, n, &f->m, f->flat) : parse_flat(in, n, &f->m, &w, f->flat);
 	pws_free(&w);
 	return f;
 }
 struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
 {
-	return fhl_matches_mt(in, n, 256, 1);
+	return fhl_matches_mt(in, n, 256, 1, 0);
 }
 void fhl_matches_free(struct fhl_mf *f)
 {
@@ -1192,24 +1307,27 @@ static uint8_t *slurp(const char *path, size_t *n)
 
 int main(int argc, char **argv)
 {
-	int K = 0, passes = 1, fast = 0;
-	unsigned depth = 256, threads = 5;
+	struct copts o = { .K = 0, .passes = 1, .depth = 256, .threads = 5 };
 	int a = 2;
 	while (a < argc && argv[a][0] == '-') {
-		if (!strcmp(argv[a], "-f")) { fast = 1; a++; continue; }
+		if (!strcmp(argv[a], "-f")) { o.fast = 1; a++; continue; }
+		if (!strcmp(argv[a], "-t")) { o.tree = 1; a++; continue; }
+		if (!strcmp(argv[a], "-g")) { o.greedy = 1; a++; continue; }
 		if (a + 1 >= argc) break;
-		if (!strcmp(argv[a], "-K")) K = atoi(argv[++a]);
-		else if (!strcmp(argv[a], "-p")) passes = atoi(argv[++a]);
-		else if (!strcmp(argv[a], "-d")) depth = (unsigned)atoi(argv[++a]);
-		else if (!strcmp(argv[a], "-j")) threads = (unsigned)atoi(argv[++a]);
+		if (!strcmp(argv[a], "-K")) o.K = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-p")) o.passes = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-d")) o.depth = (unsigned)atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-j")) o.threads = (unsigned)atoi(argv[++a]);
 		a++;
 	}
 	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') ||
-	    (K && (K > MAXK || (K & (K - 1)))) || threads < 1) {
-		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-f] [-j threads] in out\n"
+	    (o.K && (o.K > MAXK || (o.K & (o.K - 1)))) || o.threads < 1) {
+		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out\n"
 				"       fhl d in out\n"
-				"  -f  price every K from one parse: faster, up to 0.05%%\n"
-				"      larger streams (default re-parses for each K)\n");
+				"  -t  binary-tree match finder (serial; faster on one core, finds more)\n"
+				"  -g  seed the prices with a greedy parse instead of a flat-priced one\n"
+				"  -f  price every K from one parse and write the most promising\n"
+				"  fastest: -t -g -f; each costs at most a few hundredths of a percent\n");
 		return 1;
 	}
 	size_t n, on;
@@ -1218,7 +1336,7 @@ int main(int argc, char **argv)
 	if (argv[1][0] == 'c') {
 		if (n > 0xffffffffu) { fprintf(stderr, "%s: too large\n", argv[a]); return 1; }
 		out = malloc(n * 2 + 65536);
-		on = compress(in, (uint32_t)n, out, K, passes, depth, threads, fast);
+		on = compress(in, (uint32_t)n, out, &o);
 		uint8_t *chk = malloc(n + 1);
 		if (fhl_decode(out, on, chk, n, &t) != n || memcmp(chk, in, n)) {
 			fprintf(stderr, "%s: verify failed\n", argv[a]);
