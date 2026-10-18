@@ -740,49 +740,65 @@ static void costs_from(const uint8_t *in, const struct seq *s, size_t ns, const 
  * re-priced for every K instead of being redone for each. */
 struct hist { uint32_t (*pf)[256], (*ff)[256]; };
 
-/* Iterate parse -> statistics -> prices; returns the final parse length and
- * leaves the parse's literal histograms in *h when h is not NULL. */
-static size_t parse_iter(const uint8_t *in, uint32_t n, const struct mf *m, struct model *md,
-			 int passes, struct seq *s, struct hist *h)
+static void hist_alloc(struct hist *h)
 {
-	struct cost *c = calloc(1, sizeof(*c));
+	h->pf = calloc(256, sizeof(*h->pf));
+	h->ff = calloc(256, sizeof(*h->ff));
+}
+static void hist_free(struct hist *h) { free(h->pf); free(h->ff); }
+
+/* Histograms of parse s into h, clustered into md's maps; prices into c. */
+static void reprice(const uint8_t *in, const struct seq *s, size_t ns, struct model *md,
+		    struct hist *h, struct cost *c)
+{
+	uint32_t cf[NCMD] = {0}, df[NDIST] = {0};
+	memset(h->pf, 0, 256 * sizeof(*h->pf)); memset(h->ff, 0, 256 * sizeof(*h->ff));
+	stats(in, s, ns, md->legacy, h->pf, h->ff, cf, df);
+	cluster(h->pf, md->K, md->map);
+	cluster(h->ff, md->Kf, md->mapf);
+	costs_from(in, s, ns, md, c);
+}
+
+/* The first parse: flat prices, and md's maps are still all zero, so it is
+ * the same parse for every K and Kf. */
+static size_t parse_flat(const uint8_t *in, uint32_t n, const struct mf *m, const struct model *md,
+			 struct seq *s)
+{
+	struct cost *c = malloc(sizeof(*c));
 	for (unsigned k = 0; k < MAXT; k++) for (unsigned x = 0; x < 256; x++) c->lit[k][x] = 8 * 16;
 	for (unsigned x = 0; x < 256; x++) c->cmd[x] = 6 * 16;
 	for (unsigned x = 0; x < NDIST; x++) c->dist[x] = 5 * 16;
-	size_t ns = 0;
-	struct hist own = { NULL, NULL }, *hh = h;
-	if (!hh) {
-		own.pf = malloc(256 * sizeof(*own.pf));
-		own.ff = malloc(256 * sizeof(*own.ff));
-		hh = &own;
-	}
-	uint32_t (*pf)[256] = hh->pf, (*ff)[256] = hh->ff;
-	uint32_t cf[NCMD], df[NDIST];
-	for (int p = 0; p < passes; p++) {
-		ns = parse(in, n, m, md, c, s);
-		memset(pf, 0, 256 * sizeof(*pf)); memset(ff, 0, 256 * sizeof(*ff));
-		memset(cf, 0, sizeof(cf)); memset(df, 0, sizeof(df));
-		stats(in, s, ns, md->legacy, pf, ff, cf, df);
-		cluster(pf, md->K, md->map);
-		cluster(ff, md->Kf, md->mapf);
-		costs_from(in, s, ns, md, c);
-	}
-	ns = parse(in, n, m, md, c, s);
+	size_t ns = parse(in, n, m, md, c, s);
 	free(c);
-	if (!h) { free(own.pf); free(own.ff); }
 	return ns;
 }
 
-/* One K of compress(), run on its own thread. With -f every K prices and
- * emits from the parse shared by all of them; otherwise this K gets its own
- * priced parse (a few hundred bytes smaller, a parse more expensive). */
+/* 'passes' rounds of statistics -> prices -> parse, starting from parse s
+ * (ns commands), which is replaced by the final one; returns its length. h
+ * is left with the histograms that priced it. */
+static size_t refine(const uint8_t *in, uint32_t n, const struct mf *m, struct model *md,
+		     int passes, struct seq *s, size_t ns, struct hist *h)
+{
+	struct cost *c = calloc(1, sizeof(*c));
+	for (int p = 0; p < passes; p++) {
+		reprice(in, s, ns, md, h, c);
+		ns = parse(in, n, m, md, c, s);
+	}
+	free(c);
+	return ns;
+}
+
+/* One K of compress(), run on its own thread, from the flat parse s0 shared
+ * by all K: with -f the parse is shared too and only the literal maps are
+ * per K; otherwise this K gets its own priced parse (a few hundred bytes
+ * smaller, a parse more expensive). */
 struct job {
 	const uint8_t *in;
 	uint32_t n;
 	const struct mf *m;
-	const struct seq *s;            /* shared parse, or NULL to parse here */
-	size_t ns;
-	const struct hist *h;           /* its literal histograms, when shared */
+	const struct seq *s0;           /* flat parse, or with -f the final one */
+	size_t ns0;
+	const struct hist *h;           /* -f: the shared parse's histograms */
 	unsigned K;
 	int passes;
 	uint8_t *out;
@@ -792,25 +808,23 @@ static void *run_job(void *arg)
 {
 	struct job *j = arg;
 	struct model md = { .K = j->K };
-	struct hist own = { NULL, NULL }, *h = (struct hist *)j->h;
+	const struct seq *s = j->s0;
+	size_t ns = j->ns0;
 	struct seq *mine = NULL;
-	const struct seq *s = j->s;
-	size_t ns = j->ns;
-	if (!s) {
-		own.pf = malloc(256 * sizeof(*own.pf));
-		own.ff = malloc(256 * sizeof(*own.ff));
-		h = &own;
+	if (j->h) {
+		cluster(j->h->pf, md.K, md.map);
+	} else {
+		struct hist h;
+		hist_alloc(&h);
 		mine = malloc(sizeof(*mine) * ((size_t)j->n + 2));
-		ns = parse_iter(j->in, j->n, j->m, &md, j->passes, mine, h);
+		memcpy(mine, s, ns * sizeof(*s));
+		ns = refine(j->in, j->n, j->m, &md, j->passes, mine, ns, &h);
 		s = mine;
+		hist_free(&h);
 	}
-	/* re-clustering the histograms of the parse that priced this K is what
-	 * parse_iter() left in md, so the per-K parse path is unchanged */
-	cluster(h->pf, md.K, md.map);
-	cluster(h->ff, md.Kf, md.mapf);
 	j->out = malloc((size_t)j->n * 2 + 65536);
 	j->size = emit(j->in, j->n, s, ns, &md, j->out);
-	free(mine); free(own.pf); free(own.ff);
+	free(mine);
 	return NULL;
 }
 
@@ -823,15 +837,17 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 {
 	struct mf m;
 	find_matches(in, n, depth, &m);
+	struct model md = { .K = Kreq > 0 ? (unsigned)Kreq : PARSE_K };
+	struct seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
+	size_t ns = parse_flat(in, n, &m, &md, s);
 	struct hist h = { NULL, NULL };
-	struct seq *s = NULL;
-	size_t ns = 0;
 	if (fast) {
-		struct model md = { .K = Kreq > 0 ? (unsigned)Kreq : PARSE_K };
-		h.pf = malloc(256 * sizeof(*h.pf));
-		h.ff = malloc(256 * sizeof(*h.ff));
-		s = malloc(sizeof(*s) * ((size_t)n + 2));
-		ns = parse_iter(in, n, &m, &md, passes, s, &h);
+		/* cluster every K from the histograms of the final parse */
+		hist_alloc(&h);
+		ns = refine(in, n, &m, &md, passes, s, ns, &h);
+		uint32_t cf[NCMD] = {0}, df[NDIST] = {0};
+		memset(h.pf, 0, 256 * sizeof(*h.pf));
+		stats(in, s, ns, 0, h.pf, h.ff, cf, df);
 	}
 	struct job jobs[5];
 	pthread_t tid[5];
@@ -850,7 +866,7 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 	size_t sz = jobs[best].size;
 	memcpy(out, jobs[best].out, sz);
 	for (unsigned k = 0; k < nj; k++) free(jobs[k].out);
-	free(s); free(h.pf); free(h.ff); free(m.c); free(m.off);
+	free(s); hist_free(&h); free(m.c); free(m.off);
 	return sz;
 }
 
@@ -878,7 +894,11 @@ size_t fhl_parse_passes(const uint8_t *in, uint32_t n, const struct fhl_mf *f, u
 			unsigned Kf, int passes, struct fhl_seq *out)
 {
 	struct model md = { .K = K, .Kf = Kf, .legacy = 1 };
-	return parse_iter(in, n, &f->m, &md, passes, out, NULL);
+	struct hist h;
+	hist_alloc(&h);
+	size_t ns = refine(in, n, &f->m, &md, passes, out, parse_flat(in, n, &f->m, &md, out), &h);
+	hist_free(&h);
+	return ns;
 }
 size_t fhl_parse(const uint8_t *in, uint32_t n, const struct fhl_mf *f, unsigned K, unsigned Kf,
 		 struct fhl_seq *out)
