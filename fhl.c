@@ -510,39 +510,97 @@ static inline uint32_t next_len(uint32_t x, uint32_t l)
 	uint32_t nb = mc < 15 ? ml_base[mc + 1] : l;
 	return nb < l ? nb : l;
 }
-/* command and length-extra price of match length x after literal-run code llc */
-static inline uint32_t lprice(const uint32_t (*lp)[65], const struct cost *c, unsigned llc, uint32_t x)
+/* The parse relaxes edges into cost[], from[] and how[] only: how[] is the
+ * candidate (index into the match finder's list, or a rep, or a literal),
+ * and the length is the distance travelled. The state a position was
+ * reached with (reps, literal run, last literals) follows from its best edge
+ * and is filled in when the parse gets there. */
+#define HOW_LIT 0xffffffffu
+#define HOW_REP 0xfffffffcu          /* + r */
+#define INF 0x7fffffff
+struct pst { uint32_t rep[3], lr; uint16_t plit; uint8_t first; };
+
+/* parse() scratch, kept across passes */
+struct pws { int32_t *cost; uint32_t *from, *how, *path; struct pst *st; };
+static void pws_alloc(struct pws *w, uint32_t n)
 {
-	if (x <= 64) return lp[llc][x];
-	unsigned mc = ml_code(x);
-	return c->cmd[llc * 16 + mc] + ml_bits[mc] * 16;
+	size_t sz = (size_t)n + 1;
+	w->cost = malloc(4 * sz); w->from = malloc(4 * sz); w->how = malloc(4 * sz);
+	w->path = malloc(4 * sz); w->st = malloc(sizeof(*w->st) * sz);
+}
+static void pws_free(struct pws *w)
+{
+	free(w->cost); free(w->from); free(w->how); free(w->path); free(w->st);
 }
 
-struct node { uint32_t cost, from, M, ds, d, lr, rep[3]; uint16_t plit; uint8_t first; };
+static inline void reach(struct pws *w, uint32_t z, int32_t t, uint32_t i, uint32_t how)
+{
+	if (t < w->cost[z]) { w->cost[z] = t; w->from[z] = i; w->how[z] = how; }
+}
+
+/* Lengths x0..x1 (at most 64) of one candidate from i: price lp[x] + k.
+ * Each length reaches its own position, so four at a time. */
+typedef int32_t v4i __attribute__((vector_size(16)));
+static inline v4i ld4(const void *p) { v4i v; memcpy(&v, p, 16); return v; }
+static inline void st4(void *p, v4i v) { memcpy(p, &v, 16); }
+static inline void reach_run(struct pws *w, uint32_t i, const int32_t *lp, int32_t k, uint32_t x0,
+			     uint32_t x1, uint32_t how)
+{
+	uint32_t x = x0;
+	int32_t *cost = w->cost + i;
+	const v4i vk = { k, k, k, k }, vi = { (int32_t)i, (int32_t)i, (int32_t)i, (int32_t)i },
+		  vh = { (int32_t)how, (int32_t)how, (int32_t)how, (int32_t)how };
+	for (; x + 3 <= x1; x += 4) {
+		v4i t = ld4(lp + x) + vk, o = ld4(cost + x), b = t < o;
+		if (!(b[0] | b[1] | b[2] | b[3])) continue;
+		st4(cost + x, (t & b) | (o & ~b));
+		st4(w->from + i + x, (vi & b) | (ld4(w->from + i + x) & ~b));
+		st4(w->how + i + x, (vh & b) | (ld4(w->how + i + x) & ~b));
+	}
+	for (; x <= x1; x++) reach(w, i + x, lp[x] + k, i, how);
+}
+
+/* the price of length x > 64 after literal-run code llc */
+static inline int32_t lprice(const struct cost *c, unsigned llc, uint32_t x)
+{
+	unsigned mc = ml_code(x);
+	return (int32_t)(c->cmd[llc * 16 + mc] + ml_bits[mc] * 16);
+}
 
 static size_t parse(const uint8_t *in, uint32_t n, const struct mf *m, const struct model *md,
-		    const struct cost *c, struct seq *out)
+		    const struct cost *c, struct pws *w, struct seq *out)
 {
-	uint32_t lp[16][65];
+	int32_t lp[16][68];
 	for (unsigned a = 0; a < 16; a++)
 		for (uint32_t x = MIN_MATCH; x <= 64; x++)
-			lp[a][x] = c->cmd[a * 16 + ml_code(x)] + ml_bits[ml_code(x)] * 16;
-	struct node *nd = malloc(sizeof(*nd) * ((size_t)n + 1));
-	for (uint32_t i = 0; i <= n; i++) nd[i].cost = 0xffffffff;
-	nd[0] = (struct node){ .cost = 0, .rep = { 1, 1, 1 } };
+			lp[a][x] = (int32_t)(c->cmd[a * 16 + ml_code(x)] + ml_bits[ml_code(x)] * 16);
+	struct pst *st = w->st;
+	for (uint32_t i = 0; i <= n; i++) w->cost[i] = INF;
+	w->cost[0] = 0;
+	st[0] = (struct pst){ .rep = { 1, 1, 1 } };
 	for (uint32_t i = 0; i < n; i++) {
-		struct node *a = &nd[i];
-		uint32_t base = a->cost;
+		struct pst *a = &st[i];
+		if (i) {
+			const struct pst *p = &st[w->from[i]];
+			uint32_t how = w->how[i];
+			if (how == HOW_LIT) {
+				*a = *p; a->lr = p->lr + 1;
+				a->plit = (uint16_t)(p->plit << 8 | in[i - 1]);
+			} else {
+				/* rep0 keeps the reps, rep1 swaps the first two, the
+				 * rest push the distance in front */
+				uint32_t d = how >= HOW_REP ? p->rep[how - HOW_REP] : m->c[how].dist;
+				a->lr = 0; a->first = 1; a->plit = p->plit;
+				a->rep[0] = d; a->rep[1] = p->rep[how == HOW_REP ? 1 : 0];
+				a->rep[2] = p->rep[how == HOW_REP + 1 ? 2 : how == HOW_REP ? 2 : 1];
+			}
+		}
+		int32_t base = w->cost[i];
 		unsigned llc = ll_code(a->lr);
 		uint32_t lc = c->lit[lctx(md, in, i, a->first && a->lr == 0, a->rep[0], a->plit)][in[i]];
-		if (base + lc < nd[i + 1].cost) {
-			struct node *z = &nd[i + 1];
-			z->cost = base + lc; z->from = i; z->M = 0; z->lr = a->lr + 1; z->first = a->first;
-			z->plit = (uint16_t)(a->plit << 8 | in[i]);
-			memcpy(z->rep, a->rep, 12);
-		}
+		reach(w, i + 1, base + (int32_t)lc, i, HOW_LIT);
 		uint32_t max = n - i < MAXM ? n - i : MAXM, longest = 0;
-		uint32_t cmdbase = base + ll_bits[llc] * 16;
+		int32_t cmdbase = base + ll_bits[llc] * 16;
 		for (unsigned r = 0; r < 3; r++) {
 			uint32_t d = a->rep[r];
 			if (d > i) continue;
@@ -550,17 +608,9 @@ static size_t parse(const uint8_t *in, uint32_t n, const struct mf *m, const str
 			longest = l > longest ? l : longest;
 			if (l < MIN_MATCH) continue;
 			/* every length up to 64, then just l */
-			for (uint32_t x = MIN_MATCH; x <= l; x = x < 64 && x < l ? x + 1 : x == l ? l + 1 : l) {
-				uint32_t t = lprice(lp, c, llc, x) + cmdbase + c->dist[r];
-				struct node *z = &nd[i + x];
-				if (t < z->cost) {
-					z->cost = t; z->from = i; z->M = x; z->ds = r; z->d = d; z->lr = 0; z->first = 1;
-					z->plit = a->plit;
-					if (r == 0) memcpy(z->rep, a->rep, 12);
-					else if (r == 1) { z->rep[0] = d; z->rep[1] = a->rep[0]; z->rep[2] = a->rep[2]; }
-					else { z->rep[0] = d; z->rep[1] = a->rep[0]; z->rep[2] = a->rep[1]; }
-				}
-			}
+			int32_t k = cmdbase + (int32_t)c->dist[r];
+			reach_run(w, i, lp[llc], k, MIN_MATCH, l < 64 ? l : 64, HOW_REP + r);
+			if (l > 64) reach(w, i + l, lprice(c, llc, l) + k, i, HOW_REP + r);
 		}
 		uint32_t lo = MIN_MATCH + 1;
 		for (uint32_t k = m->off[i]; k < m->off[i + 1]; k++) {
@@ -568,35 +618,35 @@ static size_t parse(const uint8_t *in, uint32_t n, const struct mf *m, const str
 			longest = l > longest ? l : longest;
 			if (d == a->rep[0] || d == a->rep[1] || d == a->rep[2]) { lo = l + 1; continue; }
 			unsigned sl = dist_slot(d - 1);
-			uint32_t dc = c->dist[3 + sl] + (sl < 4 ? 0 : ((sl >> 1) - 1) * 16);
+			int32_t dk = cmdbase + (int32_t)(c->dist[3 + sl] + (sl < 4 ? 0 : ((sl >> 1) - 1) * 16));
 			uint32_t x = lo;
-			if (x > 64 && x < l && x != ml_base[ml_code(x)]) x = next_len(x, l);
-			for (; x <= l; x = next_len(x, l)) {
-				uint32_t t = lprice(lp, c, llc, x) + cmdbase + dc;
-				struct node *z = &nd[i + x];
-				if (t < z->cost) {
-					z->cost = t; z->from = i; z->M = x; z->ds = 3 + sl; z->d = d; z->lr = 0; z->first = 1;
-					z->plit = a->plit;
-					z->rep[0] = d; z->rep[1] = a->rep[0]; z->rep[2] = a->rep[1];
-				}
+			if (x <= 64) {
+				reach_run(w, i, lp[llc], dk, x, l < 64 ? l : 64, k);
+				x = next_len(64, l);
+			} else if (x < l && x != ml_base[ml_code(x)]) {
+				x = next_len(x, l);
 			}
+			/* past 64: the bucket starts and l itself */
+			for (; x <= l; x = next_len(x, l)) reach(w, i + x, lprice(c, llc, x) + dk, i, k);
 			lo = l + 1;
 		}
 		if (longest >= NICE)    /* take long matches greedily: jump over them */
 			i += longest - 1;
 	}
-	uint32_t *path = malloc(4 * ((size_t)n + 1));
+	uint32_t *path = w->path;
 	size_t np = 0, k = 0;
-	for (uint32_t i = n; i > 0; i = nd[i].from) path[np++] = i;
+	for (uint32_t i = n; i > 0; i = w->from[i]) path[np++] = i;
 	uint32_t L = 0;
 	for (size_t p = np; p-- > 0;) {
-		struct node *z = &nd[path[p]];
-		if (z->M == 0) { L++; continue; }
-		out[k] = (struct seq){ L, z->M, z->ds, z->d };
+		uint32_t z = path[p], f = w->from[z], how = w->how[z];
+		if (how == HOW_LIT) { L++; continue; }
+		uint32_t d, ds;
+		if (how >= HOW_REP) { ds = how - HOW_REP; d = st[f].rep[ds]; }
+		else { d = m->c[how].dist; ds = 3 + dist_slot(d - 1); }
+		out[k] = (struct seq){ L, z - f, ds, d };
 		L = 0; k++;
 	}
 	out[k] = (struct seq){ L, 0, 0, 0 };
-	free(path); free(nd);
 	return k + 1;
 }
 
@@ -839,13 +889,13 @@ static void reprice(const uint8_t *in, const struct seq *s, size_t ns, struct mo
 /* The first parse: flat prices, and md's maps are still all zero, so it is
  * the same parse for every K and Kf. */
 static size_t parse_flat(const uint8_t *in, uint32_t n, const struct mf *m, const struct model *md,
-			 struct seq *s)
+			 struct pws *w, struct seq *s)
 {
 	struct cost *c = malloc(sizeof(*c));
 	for (unsigned k = 0; k < MAXT; k++) for (unsigned x = 0; x < 256; x++) c->lit[k][x] = 8 * 16;
 	for (unsigned x = 0; x < 256; x++) c->cmd[x] = 6 * 16;
 	for (unsigned x = 0; x < NDIST; x++) c->dist[x] = 5 * 16;
-	size_t ns = parse(in, n, m, md, c, s);
+	size_t ns = parse(in, n, m, md, c, w, s);
 	free(c);
 	return ns;
 }
@@ -854,12 +904,12 @@ static size_t parse_flat(const uint8_t *in, uint32_t n, const struct mf *m, cons
  * (ns commands), which is replaced by the final one; returns its length. h
  * is left with the histograms that priced it. */
 static size_t refine(const uint8_t *in, uint32_t n, const struct mf *m, struct model *md,
-		     int passes, struct seq *s, size_t ns, struct hist *h)
+		     int passes, struct pws *w, struct seq *s, size_t ns, struct hist *h)
 {
 	struct cost *c = calloc(1, sizeof(*c));
 	for (int p = 0; p < passes; p++) {
 		reprice(in, s, ns, md, h, c);
-		ns = parse(in, n, m, md, c, s);
+		ns = parse(in, n, m, md, c, w, s);
 	}
 	free(c);
 	return ns;
@@ -878,6 +928,8 @@ struct job {
 	const struct hist *h;           /* -f: the shared parse's histograms */
 	unsigned K;
 	int passes;
+	struct pws *w;                  /* parse scratch and */
+	struct seq *buf;                /* parse of this K, shared by the K's run one after another */
 	uint8_t *out;
 	size_t size;
 };
@@ -887,21 +939,18 @@ static void *run_job(void *arg)
 	struct model md = { .K = j->K };
 	const struct seq *s = j->s0;
 	size_t ns = j->ns0;
-	struct seq *mine = NULL;
 	if (j->h) {
 		cluster(j->h->pf, md.K, md.map);
 	} else {
 		struct hist h;
 		hist_alloc(&h);
-		mine = malloc(sizeof(*mine) * ((size_t)j->n + 2));
-		memcpy(mine, s, ns * sizeof(*s));
-		ns = refine(j->in, j->n, j->m, &md, j->passes, mine, ns, &h);
-		s = mine;
+		memcpy(j->buf, s, ns * sizeof(*s));
+		ns = refine(j->in, j->n, j->m, &md, j->passes, j->w, j->buf, ns, &h);
+		s = j->buf;
 		hist_free(&h);
 	}
 	j->out = malloc((size_t)j->n * 2 + 65536);
 	j->size = emit(j->in, j->n, s, ns, &md, j->out);
-	free(mine);
 	return NULL;
 }
 
@@ -916,22 +965,33 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 	find_matches(in, n, depth, &m);
 	struct model md = { .K = Kreq > 0 ? (unsigned)Kreq : PARSE_K };
 	struct seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
-	size_t ns = parse_flat(in, n, &m, &md, s);
+	struct pws w;
+	pws_alloc(&w, n);
+	size_t ns = parse_flat(in, n, &m, &md, &w, s);
 	struct hist h = { NULL, NULL };
 	if (fast) {
 		/* cluster every K from the histograms of the final parse */
 		hist_alloc(&h);
-		ns = refine(in, n, &m, &md, passes, s, ns, &h);
+		ns = refine(in, n, &m, &md, passes, &w, s, ns, &h);
 		uint32_t cf[NCMD] = {0}, df[NDIST] = {0};
 		memset(h.pf, 0, 256 * sizeof(*h.pf));
 		stats(in, s, ns, 0, h.pf, h.ff, cf, df);
 	}
 	struct job jobs[5];
 	pthread_t tid[5];
+	struct pws ws[5];
+	struct seq *buf[5] = { NULL };
 	unsigned nj = 0;
 	for (unsigned K = 1; K <= MAXK; K *= 2)
 		if (Kreq <= 0 || K == (unsigned)Kreq)
-			jobs[nj++] = (struct job){ in, n, &m, s, ns, fast ? &h : NULL, K, passes, NULL, 0 };
+			jobs[nj++] = (struct job){ in, n, &m, s, ns, fast ? &h : NULL, K, passes, NULL, NULL, NULL, 0 };
+	unsigned nw = fast ? 0 : threads < nj ? threads : nj;
+	ws[0] = w;
+	for (unsigned k = 0; k < nw; k++) {
+		if (k) pws_alloc(&ws[k], n);
+		buf[k] = malloc(sizeof(*buf[k]) * ((size_t)n + 2));
+	}
+	for (unsigned k = 0; k < nj && nw; k++) { jobs[k].w = &ws[k % nw]; jobs[k].buf = buf[k % nw]; }
 	for (unsigned a = 0; a < nj; a += threads) {
 		unsigned b = a + threads < nj ? a + threads : nj;
 		for (unsigned k = a + 1; k < b; k++) pthread_create(&tid[k], NULL, run_job, &jobs[k]);
@@ -943,7 +1003,8 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 	size_t sz = jobs[best].size;
 	memcpy(out, jobs[best].out, sz);
 	for (unsigned k = 0; k < nj; k++) free(jobs[k].out);
-	free(s); hist_free(&h); free(m.c); free(m.off);
+	for (unsigned k = 0; k < nw; k++) { if (k) pws_free(&ws[k]); free(buf[k]); }
+	free(s); hist_free(&h); pws_free(&w); free(m.c); free(m.off);
 	return sz;
 }
 
@@ -972,9 +1033,12 @@ size_t fhl_parse_passes(const uint8_t *in, uint32_t n, const struct fhl_mf *f, u
 {
 	struct model md = { .K = K, .Kf = Kf, .legacy = 1 };
 	struct hist h;
+	struct pws w;
 	hist_alloc(&h);
-	size_t ns = refine(in, n, &f->m, &md, passes, out, parse_flat(in, n, &f->m, &md, out), &h);
+	pws_alloc(&w, n);
+	size_t ns = refine(in, n, &f->m, &md, passes, &w, out, parse_flat(in, n, &f->m, &md, &w, out), &h);
 	hist_free(&h);
+	pws_free(&w);
 	return ns;
 }
 size_t fhl_parse(const uint8_t *in, uint32_t n, const struct fhl_mf *f, unsigned K, unsigned Kf,
