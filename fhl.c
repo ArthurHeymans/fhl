@@ -257,6 +257,7 @@ __attribute__((noinline)) size_t fhl_decode(const void *srcv, size_t n, void *ds
 	 * extras; distances come from their own stream. */
 	uint64_t dpos = (uint64_t)rd32le(src + 21) * 8;
 	uint32_t r0 = 1, r1 = 1, r2 = 1;
+	unsigned fast = nfast != 0;
 	for (;;) {
 		uint64_t pk = rd64(src + (cpos >> 3)) >> (cpos & 7);
 		uint32_t ce = t->cmd[pk & ((1u << MAXL) - 1)];
@@ -264,7 +265,7 @@ __attribute__((noinline)) size_t fhl_decode(const void *srcv, size_t n, void *ds
 		uint32_t L = ((ce >> 9) & 511) + (uint32_t)((pk >> l0) & t->msk[llx]);
 		uint32_t M = (ce >> 23) + (uint32_t)((pk >> (l0 + llx)) & t->msk[mlx]);
 		cpos += l0 + llx + mlx;
-		if (__builtin_expect(nfast != 0, 1)) {
+		if (__builtin_expect(fast, 1)) {
 			__builtin_memcpy(o, lr, 16);
 			if (L > 16) __builtin_memmove(o + 16, lr + 16, L - 16);
 			o += L; lr += L;
@@ -284,7 +285,7 @@ __attribute__((noinline)) size_t fhl_decode(const void *srcv, size_t n, void *ds
 		r0 = d;
 		const uint8_t *s = o - d;
 		uint8_t *e = o + M;
-		if (__builtin_expect(nfast != 0 && d >= 8, 1)) {
+		if (__builtin_expect(fast && d >= 8, 1)) {
 			/* two 8-byte halves: valid for any d >= 8, covers M <= 16 */
 			__builtin_memcpy(o, s, 8);
 			__builtin_memcpy(o + 8, s + 8, 8);
@@ -296,7 +297,8 @@ __attribute__((noinline)) size_t fhl_decode(const void *srcv, size_t n, void *ds
 			while (o < e) *o++ = *s++;
 		}
 		o = e;
-		nfast -= nfast != 0;
+		/* Once cleared, fast stays clear even when the countdown wraps. */
+		fast &= --nfast != 0;
 	}
 	return (size_t)(o - dst);
 }
