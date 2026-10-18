@@ -310,29 +310,64 @@ static void put(struct bw *w, uint32_t v, unsigned n)
 	while (w->cnt >= 8) { *w->p++ = (uint8_t)w->acc; w->acc >>= 8; w->cnt -= 8; }
 }
 
-/* Huffman code lengths limited to maxl (frequency halving until it fits). */
+/* Huffman code lengths limited to maxl (frequency halving until it fits).
+ *
+ * The live nodes sit in slots 0..na-1; each step merges the two lightest
+ * (the lower slot wins ties), moves the node in the last slot into the
+ * higher freed one and puts the new node in the lower. A heap ordered by
+ * (weight, slot) makes those choices in O(log n) instead of a scan. */
+struct hheap { const uint64_t *f; int *slot, *pos, *h, n; };
+static inline int hless(const struct hheap *q, int x, int y)
+{
+	return q->f[x] < q->f[y] || (q->f[x] == q->f[y] && q->slot[x] < q->slot[y]);
+}
+static inline void hset(struct hheap *q, int i, int x) { q->h[i] = x; q->pos[x] = i; }
+static void hup(struct hheap *q, int i)
+{
+	int x = q->h[i];
+	for (; i > 0 && hless(q, x, q->h[(i - 1) / 2]); i = (i - 1) / 2) hset(q, i, q->h[(i - 1) / 2]);
+	hset(q, i, x);
+}
+static int hpop(struct hheap *q)
+{
+	int top = q->h[0], x = q->h[--q->n], i = 0;
+	for (;;) {
+		int c = 2 * i + 1;
+		if (c >= q->n) break;
+		if (c + 1 < q->n && hless(q, q->h[c + 1], q->h[c])) c++;
+		if (!hless(q, q->h[c], x)) break;
+		hset(q, i, q->h[c]); i = c;
+	}
+	if (q->n) hset(q, i, x);
+	return top;
+}
+
 static void huff_len(const uint32_t *freq, unsigned n, unsigned maxl, uint8_t *len)
 {
 	uint64_t f[512];
-	int par[512], act[512];
+	int par[512], at[512], slot[512], pos[512], h[512];
 	for (unsigned scale = 0;; scale++) {
-		int nn = 0, na = 0;
+		int nn = 0;
 		memset(len, 0, n);
+		struct hheap q = { f, slot, pos, h, 0 };
 		for (unsigned s = 0; s < n; s++)
-			if (freq[s]) { f[nn] = scale ? (freq[s] >> scale) + 1 : freq[s]; par[nn] = -1; act[na++] = nn++; }
+			if (freq[s]) {
+				f[nn] = scale ? (freq[s] >> scale) + 1 : freq[s];
+				par[nn] = -1; at[nn] = nn; slot[nn] = nn;
+				hset(&q, q.n++, nn); hup(&q, q.n - 1);
+				nn++;
+			}
 		if (nn == 0) return;
 		if (nn == 1) { for (unsigned s = 0; s < n; s++) if (freq[s]) len[s] = 1; return; }
-		while (na > 1) {
-			int a = 0, b2 = 1;
-			if (f[act[b2]] < f[act[a]]) { a = 1; b2 = 0; }
-			for (int i = 2; i < na; i++) {
-				if (f[act[i]] < f[act[a]]) { b2 = a; a = i; }
-				else if (f[act[i]] < f[act[b2]]) b2 = i;
-			}
-			f[nn] = f[act[a]] + f[act[b2]]; par[nn] = -1;
-			par[act[a]] = nn; par[act[b2]] = nn;
-			int hi = a > b2 ? a : b2, lo = a > b2 ? b2 : a;
-			act[hi] = act[--na]; act[lo] = nn++;
+		for (int na = nn; na > 1; nn++) {
+			int a = hpop(&q), b = hpop(&q);
+			f[nn] = f[a] + f[b]; par[nn] = -1;
+			par[a] = nn; par[b] = nn;
+			int hi = slot[a] > slot[b] ? slot[a] : slot[b], lo = slot[a] + slot[b] - hi;
+			int last = at[--na];
+			if (hi != na) { at[hi] = last; slot[last] = hi; hup(&q, pos[last]); }
+			at[lo] = nn; slot[nn] = lo;
+			hset(&q, q.n++, nn); hup(&q, q.n - 1);
 		}
 		unsigned mx = 0, k = 0;
 		for (unsigned s = 0; s < n; s++) {
