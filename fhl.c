@@ -314,67 +314,72 @@ static void put(struct bw *w, uint32_t v, unsigned n)
  *
  * The live nodes sit in slots 0..na-1; each step merges the two lightest
  * (the lower slot wins ties), moves the node in the last slot into the
- * higher freed one and puts the new node in the lower. A heap ordered by
- * (weight, slot) makes those choices in O(log n) instead of a scan. */
-struct hheap { const uint64_t *f; int *slot, *pos, *h, n; };
-static inline int hless(const struct hheap *q, int x, int y)
+ * higher freed one and puts the new node in the lower. A heap of keys
+ * weight:slot:node, all distinct, makes those choices in O(log n). */
+#define HK(f, slot, node) ((f) << 18 | (uint64_t)(slot) << 9 | (uint64_t)(node))
+static inline void hsift(uint64_t *h, int *pos, int n, int i)
 {
-	return q->f[x] < q->f[y] || (q->f[x] == q->f[y] && q->slot[x] < q->slot[y]);
-}
-static inline void hset(struct hheap *q, int i, int x) { q->h[i] = x; q->pos[x] = i; }
-static void hup(struct hheap *q, int i)
-{
-	int x = q->h[i];
-	for (; i > 0 && hless(q, x, q->h[(i - 1) / 2]); i = (i - 1) / 2) hset(q, i, q->h[(i - 1) / 2]);
-	hset(q, i, x);
-}
-static int hpop(struct hheap *q)
-{
-	int top = q->h[0], x = q->h[--q->n], i = 0;
+	uint64_t x = h[i];
 	for (;;) {
 		int c = 2 * i + 1;
-		if (c >= q->n) break;
-		if (c + 1 < q->n && hless(q, q->h[c + 1], q->h[c])) c++;
-		if (!hless(q, q->h[c], x)) break;
-		hset(q, i, q->h[c]); i = c;
+		if (c >= n) break;
+		c += c + 1 < n && h[c + 1] < h[c];
+		if (h[c] >= x) break;
+		h[i] = h[c]; pos[h[i] & 511] = i; i = c;
 	}
-	if (q->n) hset(q, i, x);
-	return top;
+	h[i] = x; pos[x & 511] = i;
+}
+static inline void hrise(uint64_t *h, int *pos, int i)
+{
+	uint64_t x = h[i];
+	for (; i > 0 && x < h[(i - 1) / 2]; i = (i - 1) / 2) { h[i] = h[(i - 1) / 2]; pos[h[i] & 511] = i; }
+	h[i] = x; pos[x & 511] = i;
 }
 
 static void huff_len(const uint32_t *freq, unsigned n, unsigned maxl, uint8_t *len)
 {
-	uint64_t f[512];
-	int par[512], at[512], slot[512], pos[512], h[512];
+	uint64_t f[512], h[512];
+	int par[512], at[512], slot[512], pos[512];
+	uint8_t dep[512];
 	for (unsigned scale = 0;; scale++) {
 		int nn = 0;
 		memset(len, 0, n);
-		struct hheap q = { f, slot, pos, h, 0 };
 		for (unsigned s = 0; s < n; s++)
 			if (freq[s]) {
 				f[nn] = scale ? (freq[s] >> scale) + 1 : freq[s];
-				par[nn] = -1; at[nn] = nn; slot[nn] = nn;
-				hset(&q, q.n++, nn); hup(&q, q.n - 1);
+				at[nn] = nn; slot[nn] = nn;
+				h[nn] = HK(f[nn], nn, nn);
 				nn++;
 			}
 		if (nn == 0) return;
 		if (nn == 1) { for (unsigned s = 0; s < n; s++) if (freq[s]) len[s] = 1; return; }
+		int hn = nn;
+		for (int i = hn / 2; i-- > 0;) hsift(h, pos, hn, i);
+		for (int i = hn / 2; i < hn; i++) pos[h[i] & 511] = i;
 		for (int na = nn; na > 1; nn++) {
-			int a = hpop(&q), b = hpop(&q);
-			f[nn] = f[a] + f[b]; par[nn] = -1;
+			int a = h[0] & 511;
+			h[0] = h[--hn]; hsift(h, pos, hn, 0);
+			int b = h[0] & 511;
+			f[nn] = f[a] + f[b];
 			par[a] = nn; par[b] = nn;
 			int hi = slot[a] > slot[b] ? slot[a] : slot[b], lo = slot[a] + slot[b] - hi;
-			int last = at[--na];
-			if (hi != na) { at[hi] = last; slot[last] = hi; hup(&q, pos[last]); }
+			/* the new node takes b's place in the heap */
 			at[lo] = nn; slot[nn] = lo;
-			hset(&q, q.n++, nn); hup(&q, q.n - 1);
+			h[0] = HK(f[nn], lo, nn); hsift(h, pos, hn, 0);
+			int last = at[--na];
+			if (hi != na) {
+				at[hi] = last; slot[last] = hi;
+				int i = pos[last];
+				h[i] = HK(f[last], hi, last); hrise(h, pos, i);
+			}
 		}
-		unsigned mx = 0, k = 0;
-		for (unsigned s = 0; s < n; s++) {
+		/* depths top-down: parents come after their children */
+		unsigned mx = 0;
+		dep[(nn - 1) & 511] = 0;   /* (the mask quiets a bogus overflow warning) */
+		for (int x = nn - 1; x-- > 0;) dep[x] = dep[par[x]] + 1;
+		for (unsigned s = 0, k = 0; s < n; s++) {
 			if (!freq[s]) continue;
-			unsigned d = 0;
-			for (int x = k; par[x] >= 0; x = par[x]) d++;
-			len[s] = (uint8_t)d; if (d > mx) mx = d;
+			len[s] = dep[k]; if (dep[k] > mx) mx = dep[k];
 			k++;
 		}
 		if (mx <= maxl) return;
@@ -777,7 +782,17 @@ static void stats(const uint8_t *in, const struct seq *s, size_t ns, int legacy,
 	}
 }
 
-/* k-means of 256 context histograms into K groups by code length */
+/* c[k] = sum of f[x] * cl[x][k] over the literals z seen, for k < kk (a
+ * constant per call site, so the k loop vectorizes) */
+static inline __attribute__((always_inline)) void group_costs(double *c, const uint32_t *f, const uint8_t *z,
+							      unsigned nz, const double (*cl)[MAXK], unsigned kk)
+{
+	for (unsigned i = 0; i < nz; i++) {
+		double v = f[z[i]];
+		for (unsigned k = 0; k < kk; k++) c[k] += v * cl[z[i]][k];
+	}
+}
+
 static void cluster(uint32_t (*pf)[256], unsigned K, uint8_t *map)
 {
 	for (unsigned p = 0; p < 256; p++) map[p] = (uint8_t)((p * K) >> 8);
@@ -788,26 +803,27 @@ static void cluster(uint32_t (*pf)[256], unsigned K, uint8_t *map)
 	unsigned nn[256];
 	for (unsigned p = 0, q = 0; p < 256; q += nn[p++]) {
 		nn[p] = 0;
-		for (unsigned x = 0; x < 256; x++) if (pf[p][x]) nz[q + nn[p]++] = (uint8_t)x;
+		for (unsigned x = 0; x < 256; x++) { nz[q + nn[p]] = (uint8_t)x; nn[p] += pf[p][x] != 0; }
 	}
 	for (int it = 0; it < 30; it++) {
-		memset(sum, 0, sizeof(double[MAXT][256]));
-		for (unsigned p = 0; p < 256; p++)
-			for (unsigned x = 0; x < 256; x++) sum[map[p]][x] += pf[p][x];
+		memset(sum, 0, K * sizeof(*sum));
+		const uint8_t *z = nz;
+		for (unsigned p = 0; p < 256; z += nn[p++])
+			for (unsigned i = 0; i < nn[p]; i++) sum[map[p]][z[i]] += pf[p][z[i]];
 		for (unsigned k = 0; k < K; k++) {
 			double t = 0;
 			for (unsigned x = 0; x < 256; x++) t += sum[k][x] + 0.2;
 			for (unsigned x = 0; x < 256; x++) cl[x][k] = -__builtin_log2((sum[k][x] + 0.2) / t);
 		}
 		int changed = 0;
-		const uint8_t *z = nz;
+		z = nz;
 		for (unsigned p = 0; p < 256; z += nn[p++]) {
 			/* all K costs at once, each summed in literal order */
 			double c[MAXK] = { 0 };
-			for (unsigned i = 0; i < nn[p]; i++) {
-				double v = pf[p][z[i]];
-				for (unsigned k = 0; k < MAXK; k++) c[k] += v * cl[z[i]][k];
-			}
+			if (K <= 2) group_costs(c, pf[p], z, nn[p], cl, 2);
+			else if (K <= 4) group_costs(c, pf[p], z, nn[p], cl, 4);
+			else if (K <= 8) group_costs(c, pf[p], z, nn[p], cl, 8);
+			else group_costs(c, pf[p], z, nn[p], cl, 16);
 			double best = 1e300; unsigned bk = map[p];
 			for (unsigned k = 0; k < K; k++) if (c[k] < best) { best = c[k]; bk = k; }
 			if (bk != map[p]) { map[p] = (uint8_t)bk; changed = 1; }
