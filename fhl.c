@@ -502,9 +502,16 @@ struct mfseg {
 	struct { uint32_t i; struct run r; } *ev;   /* long matches started, by position */
 	size_t nev;
 };
-static void *mf_seg(void *arg)
+struct mfq { struct mfseg *g; unsigned ns, next; };
+static void mf_one(struct mfseg *g);
+static void *mf_work(void *arg)
 {
-	struct mfseg *g = arg;
+	struct mfq *q = arg;
+	for (unsigned t; (t = __atomic_fetch_add(&q->next, 1, __ATOMIC_RELAXED)) < q->ns;) mf_one(&q->g[t]);
+	return NULL;
+}
+static void mf_one(struct mfseg *g)
+{
 	struct run r = { 0, 0 };
 	size_t cap = 0;
 	for (uint32_t i = g->a; i < g->b; i++) {
@@ -517,7 +524,6 @@ static void *mf_seg(void *arg)
 		}
 	}
 	g->off[g->b - g->a] = (uint32_t)g->c.k;
-	return NULL;
 }
 
 static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads, struct mf *m)
@@ -530,22 +536,27 @@ static void find_matches(const uint8_t *in, uint32_t n, unsigned depth, unsigned
 		prv[i] = head[h]; head[h] = i;
 	}
 	free(head);
-	unsigned ns = threads < 1 ? 1 : threads > 16 ? 16 : threads;
-	if (n < 65536 * ns) ns = n / 65536 ? n / 65536 : 1;
-	struct mfseg g[16];
-	pthread_t tid[16];
+	/* segments of 16 KiB or more, a few per thread for balance */
+	enum { MAXSEG = 64 };
+	unsigned nt = threads < 1 ? 1 : threads, ns = n / 16384 ? n / 16384 : 1;
+	ns = nt == 1 ? 1 : ns < 4 * nt ? ns : 4 * nt;
+	ns = ns < MAXSEG ? ns : MAXSEG;
+	nt = nt < ns ? nt : ns;
+	struct mfseg g[MAXSEG];
+	pthread_t tid[MAXSEG];
 	for (unsigned t = 0; t < ns; t++) {
 		g[t] = (struct mfseg){ in, prv, n, (uint32_t)((uint64_t)n * t / ns),
 				       (uint32_t)((uint64_t)n * (t + 1) / ns), depth, { NULL, 0, 0 }, NULL, NULL, 0 };
 		g[t].off = malloc(4 * ((size_t)(g[t].b - g[t].a) + 1));
 	}
-	for (unsigned t = 1; t < ns; t++) pthread_create(&tid[t], NULL, mf_seg, &g[t]);
-	mf_seg(&g[0]);
-	for (unsigned t = 1; t < ns; t++) pthread_join(tid[t], NULL);
+	struct mfq q = { g, ns, 0 };
+	for (unsigned t = 1; t < nt; t++) pthread_create(&tid[t], NULL, mf_work, &q);
+	mf_work(&q);
+	for (unsigned t = 1; t < nt; t++) pthread_join(tid[t], NULL);
 
 	/* stitch: redo each segment's start in the state the one before ended in */
-	struct cbuf fix[16] = { { NULL, 0, 0 } };
-	uint32_t conv[16], *foff = malloc(4 * ((size_t)n + 1));
+	struct cbuf fix[MAXSEG] = { { NULL, 0, 0 } };
+	uint32_t conv[MAXSEG], *foff = malloc(4 * ((size_t)n + 1));
 	struct run r = { 0, 0 };
 	size_t total = 0;
 	for (unsigned t = 0; t < ns; t++) {
@@ -981,16 +992,16 @@ static void reprice(const uint8_t *in, const struct seq *s, size_t ns, struct mo
 	costs_from(in, s, ns, md, c);
 }
 
-/* The first parse: flat prices, and md's maps are still all zero, so it is
- * the same parse for every K and Kf. */
-static size_t parse_flat(const uint8_t *in, uint32_t n, const struct mf *m, const struct model *md,
-			 struct pws *w, struct seq *s)
+/* The first parse: flat prices, so it is the same for every model. */
+static size_t parse_flat(const uint8_t *in, uint32_t n, const struct mf *m, struct pws *w,
+			 struct seq *s)
 {
+	struct model md = { .K = 1 };
 	struct cost *c = malloc(sizeof(*c));
 	for (unsigned k = 0; k < MAXT; k++) for (unsigned x = 0; x < 256; x++) c->lit[k][x] = 8 * 16;
 	for (unsigned x = 0; x < 256; x++) c->cmd[x] = 6 * 16;
 	for (unsigned x = 0; x < NDIST; x++) c->dist[x] = 5 * 16;
-	size_t ns = parse(in, n, m, md, c, w, s);
+	size_t ns = parse(in, n, m, &md, c, w, s);
 	free(c);
 	return ns;
 }
@@ -1062,7 +1073,7 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 	struct seq *s = malloc(sizeof(*s) * ((size_t)n + 2));
 	struct pws w;
 	pws_alloc(&w, n);
-	size_t ns = parse_flat(in, n, &m, &md, &w, s);
+	size_t ns = parse_flat(in, n, &m, &w, s);
 	struct hist h = { NULL, NULL };
 	if (fast) {
 		/* cluster every K from the histograms of the final parse */
@@ -1104,15 +1115,21 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 }
 
 /* The parser for ANZ (github.com/ArthurHeymans/anz). fhl_matches() runs the
- * match finder once; fhl_parse() is then thread-safe and gives an FHL parse
- * priced with ANZ's literal context: K previous-byte tables and Kf
- * match-byte tables, four passes. out needs n + 2 entries; returns the
- * number of commands, the last of which has M == 0 (literals only). */
-struct fhl_mf { struct mf m; };
+ * match finder and the flat-priced first parse once; fhl_parse() is then
+ * thread-safe and gives an FHL parse priced with ANZ's literal context: K
+ * previous-byte tables and Kf match-byte tables, four passes. out needs
+ * n + 2 entries; returns the number of commands, the last of which has
+ * M == 0 (literals only). */
+struct fhl_mf { struct mf m; struct seq *flat; size_t nflat; };
 struct fhl_mf *fhl_matches_mt(const uint8_t *in, uint32_t n, unsigned depth, unsigned threads)
 {
 	struct fhl_mf *f = malloc(sizeof(*f));
+	struct pws w;
 	find_matches(in, n, depth, threads, &f->m);
+	pws_alloc(&w, n);
+	f->flat = malloc(sizeof(*f->flat) * ((size_t)n + 2));
+	f->nflat = parse_flat(in, n, &f->m, &w, f->flat);
+	pws_free(&w);
 	return f;
 }
 struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
@@ -1121,7 +1138,7 @@ struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
 }
 void fhl_matches_free(struct fhl_mf *f)
 {
-	free(f->m.c); free(f->m.off); free(f);
+	free(f->m.c); free(f->m.off); free(f->flat); free(f);
 }
 size_t fhl_parse_passes(const uint8_t *in, uint32_t n, const struct fhl_mf *f, unsigned K,
 			unsigned Kf, int passes, struct fhl_seq *out)
@@ -1131,7 +1148,8 @@ size_t fhl_parse_passes(const uint8_t *in, uint32_t n, const struct fhl_mf *f, u
 	struct pws w;
 	hist_alloc(&h);
 	pws_alloc(&w, n);
-	size_t ns = refine(in, n, &f->m, &md, passes, &w, out, parse_flat(in, n, &f->m, &md, &w, out), &h);
+	memcpy(out, f->flat, f->nflat * sizeof(*out));
+	size_t ns = refine(in, n, &f->m, &md, passes, &w, out, f->nflat, &h);
 	hist_free(&h);
 	pws_free(&w);
 	return ns;
