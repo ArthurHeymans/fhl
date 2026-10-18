@@ -591,29 +591,39 @@ static void cluster(uint32_t (*pf)[256], unsigned K, uint8_t *map)
 {
 	for (unsigned p = 0; p < 256; p++) map[p] = (uint8_t)((p * K) >> 8);
 	if (K <= 1) { memset(map, 0, 256); return; }
-	double (*cl)[256] = malloc(sizeof(double[MAXT][256])), (*sum)[256] = malloc(sizeof(double[MAXT][256]));
+	double (*sum)[256] = malloc(sizeof(double[MAXT][256]));
+	double (*cl)[MAXK] = calloc(256, sizeof(*cl));    /* [literal][group] */
+	uint8_t *nz = malloc(65536);                      /* each context's literals seen */
+	unsigned nn[256];
+	for (unsigned p = 0, q = 0; p < 256; q += nn[p++]) {
+		nn[p] = 0;
+		for (unsigned x = 0; x < 256; x++) if (pf[p][x]) nz[q + nn[p]++] = (uint8_t)x;
+	}
 	for (int it = 0; it < 30; it++) {
 		memset(sum, 0, sizeof(double[MAXT][256]));
 		for (unsigned p = 0; p < 256; p++)
-			for (unsigned s = 0; s < 256; s++) sum[map[p]][s] += pf[p][s];
+			for (unsigned x = 0; x < 256; x++) sum[map[p]][x] += pf[p][x];
 		for (unsigned k = 0; k < K; k++) {
 			double t = 0;
-			for (unsigned s = 0; s < 256; s++) t += sum[k][s] + 0.2;
-			for (unsigned s = 0; s < 256; s++) cl[k][s] = -__builtin_log2((sum[k][s] + 0.2) / t);
+			for (unsigned x = 0; x < 256; x++) t += sum[k][x] + 0.2;
+			for (unsigned x = 0; x < 256; x++) cl[x][k] = -__builtin_log2((sum[k][x] + 0.2) / t);
 		}
 		int changed = 0;
-		for (unsigned p = 0; p < 256; p++) {
-			double best = 1e300; unsigned bk = map[p];
-			for (unsigned k = 0; k < K; k++) {
-				double c = 0;
-				for (unsigned s = 0; s < 256; s++) if (pf[p][s]) c += pf[p][s] * cl[k][s];
-				if (c < best) { best = c; bk = k; }
+		const uint8_t *z = nz;
+		for (unsigned p = 0; p < 256; z += nn[p++]) {
+			/* all K costs at once, each summed in literal order */
+			double c[MAXK] = { 0 };
+			for (unsigned i = 0; i < nn[p]; i++) {
+				double v = pf[p][z[i]];
+				for (unsigned k = 0; k < MAXK; k++) c[k] += v * cl[z[i]][k];
 			}
+			double best = 1e300; unsigned bk = map[p];
+			for (unsigned k = 0; k < K; k++) if (c[k] < best) { best = c[k]; bk = k; }
 			if (bk != map[p]) { map[p] = (uint8_t)bk; changed = 1; }
 		}
 		if (!changed) break;
 	}
-	free(cl); free(sum);
+	free(sum); free(cl); free(nz);
 }
 
 static void write_lengths(struct bw *w, const uint8_t *len, unsigned total)
