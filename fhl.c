@@ -365,8 +365,19 @@ static unsigned dist_slot(uint32_t v)
 	unsigned n = 31 - __builtin_clz(v);
 	return 2 * n + ((v >> (n - 1)) & 1);
 }
-static unsigned ll_code(uint32_t L) { int c = 15; while (L < ll_base[c]) c--; return c; }
-static unsigned ml_code(uint32_t M) { int c = 15; while (c && M < ml_base[c]) c--; return c; }
+/* past the 8 one-value codes the buckets double: 2, 4, ..., 128, then the rest */
+static inline unsigned ll_code(uint32_t L)
+{
+	if (L < 8) return L;
+	unsigned c = 7 + (31 - __builtin_clz(L - 6));
+	return c < 15 ? c : 15;
+}
+static inline unsigned ml_code(uint32_t M)
+{
+	if (M < 10) return M - 2;
+	unsigned c = 7 + (31 - __builtin_clz(M - 8));
+	return c < 15 ? c : 15;
+}
 
 /* ds: 0..2 rep, else 3 + distance slot; d the actual distance */
 #define seq fhl_seq
@@ -454,11 +465,33 @@ static inline unsigned lctx(const struct model *md, const uint8_t *in, uint32_t 
 	return md->map[pos ? in[pos - 1] : 0];
 }
 
+/* Match lengths the parse tries: every one up to 64, then the bucket starts
+ * and l itself. */
+static inline uint32_t next_len(uint32_t x, uint32_t l)
+{
+	if (x < 64 && x < l) return x + 1;
+	if (x >= l) return l + 1;
+	unsigned mc = ml_code(x);
+	uint32_t nb = mc < 15 ? ml_base[mc + 1] : l;
+	return nb < l ? nb : l;
+}
+/* command and length-extra price of match length x after literal-run code llc */
+static inline uint32_t lprice(const uint32_t (*lp)[65], const struct cost *c, unsigned llc, uint32_t x)
+{
+	if (x <= 64) return lp[llc][x];
+	unsigned mc = ml_code(x);
+	return c->cmd[llc * 16 + mc] + ml_bits[mc] * 16;
+}
+
 struct node { uint32_t cost, from, M, ds, d, lr, rep[3]; uint16_t plit; uint8_t first; };
 
 static size_t parse(const uint8_t *in, uint32_t n, const struct mf *m, const struct model *md,
 		    const struct cost *c, struct seq *out)
 {
+	uint32_t lp[16][65];
+	for (unsigned a = 0; a < 16; a++)
+		for (uint32_t x = MIN_MATCH; x <= 64; x++)
+			lp[a][x] = c->cmd[a * 16 + ml_code(x)] + ml_bits[ml_code(x)] * 16;
 	struct node *nd = malloc(sizeof(*nd) * ((size_t)n + 1));
 	for (uint32_t i = 0; i <= n; i++) nd[i].cost = 0xffffffff;
 	nd[0] = (struct node){ .cost = 0, .rep = { 1, 1, 1 } };
@@ -481,10 +514,9 @@ static size_t parse(const uint8_t *in, uint32_t n, const struct mf *m, const str
 			uint32_t l = mlen(in + i, in + i - d, max);
 			longest = l > longest ? l : longest;
 			if (l < MIN_MATCH) continue;
-			for (uint32_t x = MIN_MATCH; x <= l; x++) {
-				if (x > 64 && x != l) continue;
-				unsigned mc = ml_code(x);
-				uint32_t t = cmdbase + c->cmd[llc * 16 + mc] + ml_bits[mc] * 16 + c->dist[r];
+			/* every length up to 64, then just l */
+			for (uint32_t x = MIN_MATCH; x <= l; x = x < 64 && x < l ? x + 1 : x == l ? l + 1 : l) {
+				uint32_t t = lprice(lp, c, llc, x) + cmdbase + c->dist[r];
 				struct node *z = &nd[i + x];
 				if (t < z->cost) {
 					z->cost = t; z->from = i; z->M = x; z->ds = r; z->d = d; z->lr = 0; z->first = 1;
@@ -502,10 +534,10 @@ static size_t parse(const uint8_t *in, uint32_t n, const struct mf *m, const str
 			if (d == a->rep[0] || d == a->rep[1] || d == a->rep[2]) { lo = l + 1; continue; }
 			unsigned sl = dist_slot(d - 1);
 			uint32_t dc = c->dist[3 + sl] + (sl < 4 ? 0 : ((sl >> 1) - 1) * 16);
-			for (uint32_t x = lo; x <= l; x++) {
-				if (x > 64 && x != l && x != ml_base[ml_code(x)]) continue;
-				unsigned mc = ml_code(x);
-				uint32_t t = cmdbase + c->cmd[llc * 16 + mc] + ml_bits[mc] * 16 + dc;
+			uint32_t x = lo;
+			if (x > 64 && x < l && x != ml_base[ml_code(x)]) x = next_len(x, l);
+			for (; x <= l; x = next_len(x, l)) {
+				uint32_t t = lprice(lp, c, llc, x) + cmdbase + dc;
 				struct node *z = &nd[i + x];
 				if (t < z->cost) {
 					z->cost = t; z->from = i; z->M = x; z->ds = 3 + sl; z->d = d; z->lr = 0; z->first = 1;
