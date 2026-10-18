@@ -914,13 +914,11 @@ static void write_lengths(struct bw *w, const uint8_t *len, unsigned total)
 	free(sy); free(ex);
 }
 
-/* Build code lengths for a parse under a model. */
-static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
-			  uint8_t *len)
+/* Code lengths from a parse's statistics (see stats()) under a model. */
+static void stat_lengths(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
+			 uint32_t (*pf)[256], uint32_t (*ff)[256], uint32_t *cf, uint32_t *df, uint8_t *len)
 {
-	uint32_t (*pf)[256] = calloc(256, sizeof(*pf)), (*ff)[256] = calloc(256, sizeof(*ff));
-	uint32_t (*lf)[256] = calloc(MAXT, sizeof(*lf)), cf[NCMD] = {0}, df[NDIST] = {0};
-	stats(in, s, ns, md->legacy, pf, ff, cf, df);
+	uint32_t (*lf)[256] = calloc(MAXT, sizeof(*lf));
 	for (unsigned q = 0; q < 256; q++)
 		for (unsigned x = 0; x < 256; x++) {
 			lf[md->map[q]][x] += pf[q][x];
@@ -939,7 +937,18 @@ static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, con
 	for (unsigned k = 0; k < T; k++) huff_len(lf[k], NLIT, MAXL, len + k * NLIT);
 	huff_len(cf, NCMD, MAXL, len + T * NLIT);
 	huff_len(df, NDIST, MAXL, len + T * NLIT + NCMD);
-	free(pf); free(ff); free(lf);
+	free(lf);
+}
+
+/* Build code lengths for a parse under a model. */
+static void model_lengths(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
+			  uint8_t *len)
+{
+	uint32_t (*pf)[256] = calloc(256, sizeof(*pf)), (*ff)[256] = calloc(256, sizeof(*ff));
+	uint32_t cf[NCMD] = {0}, df[NDIST] = {0};
+	stats(in, s, ns, md->legacy, pf, ff, cf, df);
+	stat_lengths(in, s, ns, md, pf, ff, cf, df, len);
+	free(pf); free(ff);
 }
 
 static void wr32(uint8_t *p, uint32_t v)
@@ -1021,11 +1030,11 @@ static size_t emit(const uint8_t *in, uint32_t n, const struct seq *s, size_t ns
 }
 
 static void costs_from(const uint8_t *in, const struct seq *s, size_t ns, const struct model *md,
-		       struct cost *c)
+		       uint32_t (*pf)[256], uint32_t (*ff)[256], uint32_t *cf, uint32_t *df, struct cost *c)
 {
 	uint8_t *len = malloc(NLEN);
 	unsigned T = md->K + md->Kf;
-	model_lengths(in, s, ns, md, len);
+	stat_lengths(in, s, ns, md, pf, ff, cf, df, len);
 	for (unsigned k = 0; k < T; k++) lens_to_cost(len + k * NLIT, NLIT, c->lit[k], 13);
 	lens_to_cost(len + T * NLIT, NCMD, c->cmd, 13);
 	lens_to_cost(len + T * NLIT + NCMD, NDIST, c->dist, 13);
@@ -1053,7 +1062,7 @@ static void reprice(const uint8_t *in, const struct seq *s, size_t ns, struct mo
 	stats(in, s, ns, md->legacy, h->pf, h->ff, cf, df);
 	cluster(h->pf, md->K, md->map);
 	cluster(h->ff, md->Kf, md->mapf);
-	costs_from(in, s, ns, md, c);
+	costs_from(in, s, ns, md, h->pf, h->ff, cf, df, c);
 }
 
 /* The first parse: flat prices, so it is the same for every model. */
@@ -1127,6 +1136,7 @@ struct job {
 	const struct seq *s0;           /* flat parse, or with -f the final one */
 	size_t ns0;
 	const struct hist *h;           /* -f: the shared parse's histograms */
+	const uint8_t *map;             /* and the K's map, if already clustered */
 	unsigned K;
 	int passes;
 	struct pws *w;                  /* parse scratch and */
@@ -1140,7 +1150,9 @@ static void *run_job(void *arg)
 	struct model md = { .K = j->K };
 	const struct seq *s = j->s0;
 	size_t ns = j->ns0;
-	if (j->h) {
+	if (j->map) {
+		memcpy(md.map, j->map, 256);
+	} else if (j->h) {
 		cluster(j->h->pf, md.K, md.map);
 	} else {
 		struct hist h;
@@ -1199,6 +1211,7 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, const struct
 	pws_alloc(&w, n);
 	size_t ns = o->greedy ? parse_greedy(in, n, &m, s) : parse_flat(in, n, &m, &w, s);
 	struct hist h = { NULL, NULL };
+	uint8_t map[256];
 	if (fast) {
 		/* cluster every K from the histograms of the final parse */
 		hist_alloc(&h);
@@ -1210,7 +1223,7 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, const struct
 		for (unsigned K = 1; K <= MAXK && o->K <= 0; K *= 2) {
 			struct model mk = { .K = K };
 			uint64_t e = lit_bits(h.pf, &mk);
-			if (e < bb) { bb = e; Kreq = (int)K; }
+			if (e < bb) { bb = e; Kreq = (int)K; memcpy(map, mk.map, 256); }
 		}
 	}
 	struct job jobs[5];
@@ -1220,7 +1233,8 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, const struct
 	unsigned nj = 0;
 	for (unsigned K = 1; K <= MAXK; K *= 2)
 		if (Kreq <= 0 || K == (unsigned)Kreq)
-			jobs[nj++] = (struct job){ in, n, &m, s, ns, fast ? &h : NULL, K, passes, NULL, NULL, NULL, 0 };
+			jobs[nj++] = (struct job){ in, n, &m, s, ns, fast ? &h : NULL, fast && o->K <= 0 ? map : NULL,
+						   K, passes, NULL, NULL, NULL, 0 };
 	unsigned nw = fast ? 0 : threads < nj ? threads : nj;
 	ws[0] = w;
 	for (unsigned k = 0; k < nw; k++) {
