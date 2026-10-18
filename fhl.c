@@ -14,8 +14,12 @@
  * matches from the output, with wide over-copies for the leading nfast
  * commands (counted by the encoder) for which those stay in bounds.
  *
- *   fhl c [-K k] [-p passes] [-d depth] [-j threads] in out   compress (and verify)
+ *   fhl c [-K k] [-p passes] [-d depth] [-f] [-j threads] in out   compress (and verify)
  *   fhl d in out                                 decompress
+ *
+ * K only enters through the literal prices, so -f prices and emits every
+ * K = 1..16 from a single parse (about half the encode time, up to 0.07%
+ * larger); the default re-parses for each K.
  *
  * Stream: u32 size | u8 K | u32 nlit | u32 nfast | u32 offsets of literal
  * streams A and B and of the distance stream | map | meta lengths | code
@@ -41,6 +45,9 @@
 #define NDIST 43
 #define NMETA 15
 #define MAXK 16                     /* literal tables in a stream */
+#ifndef PARSE_K
+#define PARSE_K 4                   /* literal tables the single parse is priced with */
+#endif
 #define MAXT 32                     /* encoder: K + Kf tables in the ANZ parse mode */
 #define NLEN (MAXT * NLIT + NCMD + NDIST)
 #define MIN_MATCH 2
@@ -728,16 +735,28 @@ static void costs_from(const uint8_t *in, const struct seq *s, size_t ns, const 
 	free(len);
 }
 
-/* Iterate parse -> statistics -> prices; returns the final parse length. */
+/* Literal histograms of one parse: [previous byte or match byte][literal].
+ * They only depend on the parse, so one parse can be re-clustered and
+ * re-priced for every K instead of being redone for each. */
+struct hist { uint32_t (*pf)[256], (*ff)[256]; };
+
+/* Iterate parse -> statistics -> prices; returns the final parse length and
+ * leaves the parse's literal histograms in *h when h is not NULL. */
 static size_t parse_iter(const uint8_t *in, uint32_t n, const struct mf *m, struct model *md,
-			 int passes, struct seq *s)
+			 int passes, struct seq *s, struct hist *h)
 {
 	struct cost *c = calloc(1, sizeof(*c));
 	for (unsigned k = 0; k < MAXT; k++) for (unsigned x = 0; x < 256; x++) c->lit[k][x] = 8 * 16;
 	for (unsigned x = 0; x < 256; x++) c->cmd[x] = 6 * 16;
 	for (unsigned x = 0; x < NDIST; x++) c->dist[x] = 5 * 16;
 	size_t ns = 0;
-	uint32_t (*pf)[256] = malloc(256 * sizeof(*pf)), (*ff)[256] = malloc(256 * sizeof(*ff));
+	struct hist own = { NULL, NULL }, *hh = h;
+	if (!hh) {
+		own.pf = malloc(256 * sizeof(*own.pf));
+		own.ff = malloc(256 * sizeof(*own.ff));
+		hh = &own;
+	}
+	uint32_t (*pf)[256] = hh->pf, (*ff)[256] = hh->ff;
 	uint32_t cf[NCMD], df[NDIST];
 	for (int p = 0; p < passes; p++) {
 		ns = parse(in, n, m, md, c, s);
@@ -749,15 +768,21 @@ static size_t parse_iter(const uint8_t *in, uint32_t n, const struct mf *m, stru
 		costs_from(in, s, ns, md, c);
 	}
 	ns = parse(in, n, m, md, c, s);
-	free(c); free(pf); free(ff);
+	free(c);
+	if (!h) { free(own.pf); free(own.ff); }
 	return ns;
 }
 
-/* One K setting of compress(), run on its own thread. */
+/* One K of compress(), run on its own thread. With -f every K prices and
+ * emits from the parse shared by all of them; otherwise this K gets its own
+ * priced parse (a few hundred bytes smaller, a parse more expensive). */
 struct job {
 	const uint8_t *in;
 	uint32_t n;
 	const struct mf *m;
+	const struct seq *s;            /* shared parse, or NULL to parse here */
+	size_t ns;
+	const struct hist *h;           /* its literal histograms, when shared */
 	unsigned K;
 	int passes;
 	uint8_t *out;
@@ -767,28 +792,53 @@ static void *run_job(void *arg)
 {
 	struct job *j = arg;
 	struct model md = { .K = j->K };
-	struct seq *s = malloc(sizeof(*s) * ((size_t)j->n + 2));
-	size_t ns = parse_iter(j->in, j->n, j->m, &md, j->passes, s);
+	struct hist own = { NULL, NULL }, *h = (struct hist *)j->h;
+	struct seq *mine = NULL;
+	const struct seq *s = j->s;
+	size_t ns = j->ns;
+	if (!s) {
+		own.pf = malloc(256 * sizeof(*own.pf));
+		own.ff = malloc(256 * sizeof(*own.ff));
+		h = &own;
+		mine = malloc(sizeof(*mine) * ((size_t)j->n + 2));
+		ns = parse_iter(j->in, j->n, j->m, &md, j->passes, mine, h);
+		s = mine;
+	}
+	/* re-clustering the histograms of the parse that priced this K is what
+	 * parse_iter() left in md, so the per-K parse path is unchanged */
+	cluster(h->pf, md.K, md.map);
+	cluster(h->ff, md.Kf, md.mapf);
 	j->out = malloc((size_t)j->n * 2 + 65536);
 	j->size = emit(j->in, j->n, s, ns, &md, j->out);
-	free(s);
+	free(mine); free(own.pf); free(own.ff);
 	return NULL;
 }
 
 /* Smallest stream over K = 1..16 (or just Kreq), up to 'threads' K at a
- * time; ties go to the smaller K. Returns its size. */
+ * time; ties go to the smaller K. 'fast' shares one parse between the K's.
+ * Returns the size of the best stream. */
 __attribute__((unused))
 static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, int passes,
-		       unsigned depth, unsigned threads)
+		       unsigned depth, unsigned threads, int fast)
 {
 	struct mf m;
 	find_matches(in, n, depth, &m);
+	struct hist h = { NULL, NULL };
+	struct seq *s = NULL;
+	size_t ns = 0;
+	if (fast) {
+		struct model md = { .K = Kreq > 0 ? (unsigned)Kreq : PARSE_K };
+		h.pf = malloc(256 * sizeof(*h.pf));
+		h.ff = malloc(256 * sizeof(*h.ff));
+		s = malloc(sizeof(*s) * ((size_t)n + 2));
+		ns = parse_iter(in, n, &m, &md, passes, s, &h);
+	}
 	struct job jobs[5];
 	pthread_t tid[5];
 	unsigned nj = 0;
 	for (unsigned K = 1; K <= MAXK; K *= 2)
 		if (Kreq <= 0 || K == (unsigned)Kreq)
-			jobs[nj++] = (struct job){ in, n, &m, K, passes, NULL, 0 };
+			jobs[nj++] = (struct job){ in, n, &m, s, ns, fast ? &h : NULL, K, passes, NULL, 0 };
 	for (unsigned a = 0; a < nj; a += threads) {
 		unsigned b = a + threads < nj ? a + threads : nj;
 		for (unsigned k = a + 1; k < b; k++) pthread_create(&tid[k], NULL, run_job, &jobs[k]);
@@ -800,7 +850,7 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
 	size_t sz = jobs[best].size;
 	memcpy(out, jobs[best].out, sz);
 	for (unsigned k = 0; k < nj; k++) free(jobs[k].out);
-	free(m.c); free(m.off);
+	free(s); free(h.pf); free(h.ff); free(m.c); free(m.off);
 	return sz;
 }
 
@@ -810,21 +860,30 @@ static size_t compress(const uint8_t *in, uint32_t n, uint8_t *out, int Kreq, in
  * match-byte tables, four passes. out needs n + 2 entries; returns the
  * number of commands, the last of which has M == 0 (literals only). */
 struct fhl_mf { struct mf m; };
-struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
+struct fhl_mf *fhl_matches_depth(const uint8_t *in, uint32_t n, unsigned depth)
 {
 	struct fhl_mf *f = malloc(sizeof(*f));
-	find_matches(in, n, 256, &f->m);
+	find_matches(in, n, depth, &f->m);
 	return f;
+}
+struct fhl_mf *fhl_matches(const uint8_t *in, uint32_t n)
+{
+	return fhl_matches_depth(in, n, 256);
 }
 void fhl_matches_free(struct fhl_mf *f)
 {
 	free(f->m.c); free(f->m.off); free(f);
 }
+size_t fhl_parse_passes(const uint8_t *in, uint32_t n, const struct fhl_mf *f, unsigned K,
+			unsigned Kf, int passes, struct fhl_seq *out)
+{
+	struct model md = { .K = K, .Kf = Kf, .legacy = 1 };
+	return parse_iter(in, n, &f->m, &md, passes, out, NULL);
+}
 size_t fhl_parse(const uint8_t *in, uint32_t n, const struct fhl_mf *f, unsigned K, unsigned Kf,
 		 struct fhl_seq *out)
 {
-	struct model md = { .K = K, .Kf = Kf, .legacy = 1 };
-	return parse_iter(in, n, &f->m, &md, 4, out);
+	return fhl_parse_passes(in, n, f, K, Kf, 4, out);
 }
 
 #ifndef FHL_LIB
@@ -843,10 +902,12 @@ static uint8_t *slurp(const char *path, size_t *n)
 
 int main(int argc, char **argv)
 {
-	int K = 0, passes = 1;
+	int K = 0, passes = 1, fast = 0;
 	unsigned depth = 256, threads = 5;
 	int a = 2;
-	while (a + 1 < argc && argv[a][0] == '-') {
+	while (a < argc && argv[a][0] == '-') {
+		if (!strcmp(argv[a], "-f")) { fast = 1; a++; continue; }
+		if (a + 1 >= argc) break;
 		if (!strcmp(argv[a], "-K")) K = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-p")) passes = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-d")) depth = (unsigned)atoi(argv[++a]);
@@ -855,8 +916,10 @@ int main(int argc, char **argv)
 	}
 	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') ||
 	    (K && (K > MAXK || (K & (K - 1)))) || threads < 1) {
-		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-j threads] in out\n"
-				"       fhl d in out\n");
+		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-f] [-j threads] in out\n"
+				"       fhl d in out\n"
+				"  -f  price every K from one parse: about half the time, up to 0.07%%\n"
+				"      larger streams (default re-parses for each K)\n");
 		return 1;
 	}
 	size_t n, on;
@@ -865,7 +928,7 @@ int main(int argc, char **argv)
 	if (argv[1][0] == 'c') {
 		if (n > 0xffffffffu) { fprintf(stderr, "%s: too large\n", argv[a]); return 1; }
 		out = malloc(n * 2 + 65536);
-		on = compress(in, (uint32_t)n, out, K, passes, depth, threads);
+		on = compress(in, (uint32_t)n, out, K, passes, depth, threads, fast);
 		uint8_t *chk = malloc(n + 1);
 		if (fhl_decode(out, on, chk, n, &t) != n || memcmp(chk, in, n)) {
 			fprintf(stderr, "%s: verify failed\n", argv[a]);

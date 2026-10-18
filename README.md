@@ -77,8 +77,12 @@ All multi-byte fields are little-endian, and bitstreams are LSB-first.
 
 The encoder runs a forward optimal parse twice: first with flat prices, then
 with Huffman prices from the first parse's statistics (more iterations made
-the streams larger). It k-means-clusters the 256 contexts into K tables. It
-tries each K on its own thread and keeps the smallest stream; `-K` picks one.
+the streams larger). It k-means-clusters the 256 contexts into K tables. By
+default it tries each K on its own thread, each with its own priced parse,
+and keeps the smallest stream; `-K` picks one. K only enters through the
+literal prices, so `-f` prices all of K = 1..16 from one parse (priced with
+PARSE_K = 4 tables) and emits each from it in parallel: about half the
+encode time for up to 0.07% larger streams.
 
 ## Use
 
@@ -91,7 +95,7 @@ size_t n = fhl_decode(src, src_len, dst, dst_cap, work);   /* 0 on a bad header 
 Build with `-DFHL_DECODER_ONLY` to get just `fhl_decode()`.
 
 ```
-make            # fhl c [-K 1|2|4|8|16] [-p passes] [-j threads] in out ; fhl d in out
+make            # fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-f] [-j threads] in out
 make test       # round trips under ASan/UBSan
 ```
 
@@ -107,6 +111,20 @@ thread.
 | **fhl `-K 1`** | 1.9 | 2.0 | 1.2 |
 | **fhl**, 1 thread | 6.4 | 6.9 | 3.6 |
 | **fhl**, 5 threads | 3.0 | 3.1 | 1.5 |
+
+That table predates `-f`. Rerun on the Ryzen 9 8945HS (the default is byte
+for byte the old encoder; `-f` costs 0.07%:
+1,716,520 → 1,717,734 B):
+
+| encoder | gcc -O2 | clang -O2 |
+|---|---:|---:|
+| `fhl`, 1 thread | 4.30 s | 3.50 s |
+| `fhl -f`, 1 thread | **1.97 s** | **1.70 s** |
+| `fhl`, 5 threads | 1.83 s | 1.64 s |
+| `fhl -f`, 5 threads | **1.64 s** | **1.49 s** |
+
+The `-f` threaded gain is small because the match finder is serial and is
+now most of the threaded run; with gcc, `-f -d 64` takes 1.42 s for +0.31%.
 
 ## Limitations
 
