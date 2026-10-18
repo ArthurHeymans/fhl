@@ -114,6 +114,11 @@ make            # fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-c] [-g] [-f] [-
 make test       # round trips under ASan/UBSan
 ```
 
+Compile the decoder at `-O2` for the speed figures above; `-Os` trades speed
+for a smaller decoder. Explicit copy builtins preserve the fixed-size loads
+and copies even with `-ffreestanding -fno-builtin`. Variable-size copies may
+still call the firmware's `memmove` implementation.
+
 Encoding the corpus takes the following time in seconds. The encoders verify
 every stream they write. FHL uses about 70 bytes of RAM per input byte per
 thread.

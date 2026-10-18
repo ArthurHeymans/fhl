@@ -69,7 +69,8 @@ static unsigned log2k(unsigned k) { return k > 8 ? 4 : k > 4 ? 3 : k > 2 ? 2 : k
 
 struct br { uint64_t bb; unsigned bc; const uint8_t *p; };
 
-static inline uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+/* Explicit builtins keep fixed-size loads/copies inline in freestanding builds. */
+static inline uint64_t rd64(const uint8_t *p) { uint64_t v; __builtin_memcpy(&v, p, 8); return v; }
 static inline uint32_t rd32le(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static inline void refill(struct br *b)
 {
@@ -264,8 +265,8 @@ __attribute__((noinline)) size_t fhl_decode(const void *srcv, size_t n, void *ds
 		uint32_t M = (ce >> 23) + (uint32_t)((pk >> (l0 + llx)) & t->msk[mlx]);
 		cpos += l0 + llx + mlx;
 		if (__builtin_expect(nfast != 0, 1)) {
-			memcpy(o, lr, 16);
-			if (L > 16) memmove(o + 16, lr + 16, L - 16);
+			__builtin_memcpy(o, lr, 16);
+			if (L > 16) __builtin_memmove(o + 16, lr + 16, L - 16);
 			o += L; lr += L;
 		} else {
 			while (L--) *o++ = *lr++;
@@ -285,11 +286,11 @@ __attribute__((noinline)) size_t fhl_decode(const void *srcv, size_t n, void *ds
 		uint8_t *e = o + M;
 		if (__builtin_expect(nfast != 0 && d >= 8, 1)) {
 			/* two 8-byte halves: valid for any d >= 8, covers M <= 16 */
-			memcpy(o, s, 8);
-			memcpy(o + 8, s + 8, 8);
+			__builtin_memcpy(o, s, 8);
+			__builtin_memcpy(o + 8, s + 8, 8);
 			if (__builtin_expect(M > 16, 0)) {
 				o += 16; s += 16;
-				do { memcpy(o, s, 8); o += 8; s += 8; } while (o < e);
+				do { __builtin_memcpy(o, s, 8); o += 8; s += 8; } while (o < e);
 			}
 		} else {
 			while (o < e) *o++ = *s++;
