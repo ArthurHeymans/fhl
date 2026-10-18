@@ -77,12 +77,14 @@ All multi-byte fields are little-endian, and bitstreams are LSB-first.
 
 The encoder runs a forward optimal parse twice: first with flat prices, then
 with Huffman prices from the first parse's statistics (more iterations made
-the streams larger). It k-means-clusters the 256 contexts into K tables. By
-default it tries each K on its own thread, each with its own priced parse,
-and keeps the smallest stream; `-K` picks one. K only enters through the
-literal prices, so `-f` prices all of K = 1..16 from one parse (priced with
-PARSE_K = 4 tables) and emits each from it in parallel: about half the
-encode time for up to 0.07% larger streams.
+the streams larger). It k-means-clusters the 256 contexts into K tables. The
+flat parse is the same for every K, so it runs once; by default each K then
+gets its own priced parse on its own thread, and the smallest stream wins;
+`-K` picks one. K only enters through the literal prices, so `-f` prices all
+of K = 1..16 from one parse (priced with PARSE_K = 4 tables) and emits each
+from it in parallel: about two thirds of the single-threaded encode time
+for up to 0.05% larger streams. The match finder searches on `-j` threads
+too, with the same matches for any thread count.
 
 ## Use
 
@@ -112,19 +114,18 @@ thread.
 | **fhl**, 1 thread | 6.4 | 6.9 | 3.6 |
 | **fhl**, 5 threads | 3.0 | 3.1 | 1.5 |
 
-That table predates `-f`. Rerun on the Ryzen 9 8945HS (the default is byte
-for byte the old encoder; `-f` costs 0.07%:
-1,716,520 → 1,717,734 B):
+That table predates the current encoder. Rerun on the Ryzen 9 8945HS: the
+default writes the same streams byte for byte (1,716,520 B), `-f` costs
+0.05% (1,717,367 B):
 
 | encoder | gcc -O2 | clang -O2 |
 |---|---:|---:|
-| `fhl`, 1 thread | 4.30 s | 3.50 s |
-| `fhl -f`, 1 thread | **1.97 s** | **1.70 s** |
-| `fhl`, 5 threads | 1.83 s | 1.64 s |
-| `fhl -f`, 5 threads | **1.64 s** | **1.49 s** |
-
-The `-f` threaded gain is small because the match finder is serial and is
-now most of the threaded run; with gcc, `-f -d 64` takes 1.42 s for +0.31%.
+| `fhl`, 1 thread (before) | 3.81 s | 3.16 s |
+| `fhl`, 1 thread | **1.52 s** | **1.48 s** |
+| `fhl -f`, 1 thread | 1.05 s | 1.03 s |
+| `fhl`, 5 threads (before) | 1.51 s | 1.36 s |
+| `fhl`, 5 threads | **0.76 s** | **0.72 s** |
+| `fhl -f`, 5 threads | 0.64 s | 0.61 s |
 
 ## Limitations
 

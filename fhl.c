@@ -18,8 +18,8 @@
  *   fhl d in out                                 decompress
  *
  * K only enters through the literal prices, so -f prices and emits every
- * K = 1..16 from a single parse (about half the encode time, up to 0.07%
- * larger); the default re-parses for each K.
+ * K = 1..16 from a single parse (about two thirds of the single-threaded
+ * encode time, up to 0.05% larger); the default re-parses for each K.
  *
  * Stream: u32 size | u8 K | u32 nlit | u32 nfast | u32 offsets of literal
  * streams A and B and of the distance stream | map | meta lengths | code
@@ -1192,7 +1192,7 @@ int main(int argc, char **argv)
 	    (K && (K > MAXK || (K & (K - 1)))) || threads < 1) {
 		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-f] [-j threads] in out\n"
 				"       fhl d in out\n"
-				"  -f  price every K from one parse: about half the time, up to 0.07%%\n"
+				"  -f  price every K from one parse: faster, up to 0.05%%\n"
 				"      larger streams (default re-parses for each K)\n");
 		return 1;
 	}
