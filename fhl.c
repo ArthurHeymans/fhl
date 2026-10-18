@@ -14,14 +14,15 @@
  * matches from the output, with wide over-copies for the leading nfast
  * commands (counted by the encoder) for which those stay in bounds.
  *
- *   fhl c [-K k] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out
+ *   fhl c [-K k] [-p passes] [-d depth] [-c] [-g] [-f] [-j threads] in out
  *                                               compress (and verify)
  *   fhl d in out                                 decompress
  *
  * K only enters through the literal prices, so -f prices every K = 1..16
  * from a single parse and writes the one with the fewest estimated literal
- * bits; the default re-parses for each K. -t swaps the hash chains for a
- * binary tree and -g the flat-priced first parse for a greedy one.
+ * bits; the default re-parses for each K. Matches come from a binary tree,
+ * or with -c from hash chains searched on several threads; -g swaps the
+ * flat-priced first parse for a greedy one.
  *
  * Stream: u32 size | u8 K | u32 nlit | u32 nfast | u32 offsets of literal
  * streams A and B and of the distance stream | map | meta lengths | code
@@ -1323,11 +1324,12 @@ static uint8_t *slurp(const char *path, size_t *n)
 
 int main(int argc, char **argv)
 {
-	struct copts o = { .K = 0, .passes = 1, .depth = 256, .threads = 5 };
+	struct copts o = { .K = 0, .passes = 1, .depth = 256, .threads = 5, .tree = 1 };
 	int a = 2;
 	while (a < argc && argv[a][0] == '-') {
 		if (!strcmp(argv[a], "-f")) { o.fast = 1; a++; continue; }
 		if (!strcmp(argv[a], "-t")) { o.tree = 1; a++; continue; }
+		if (!strcmp(argv[a], "-c")) { o.tree = 0; a++; continue; }
 		if (!strcmp(argv[a], "-g")) { o.greedy = 1; a++; continue; }
 		if (a + 1 >= argc) break;
 		if (!strcmp(argv[a], "-K")) o.K = atoi(argv[++a]);
@@ -1338,12 +1340,13 @@ int main(int argc, char **argv)
 	}
 	if (argc - a != 2 || (argv[1][0] != 'c' && argv[1][0] != 'd') ||
 	    (o.K && (o.K > MAXK || (o.K & (o.K - 1)))) || o.threads < 1) {
-		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out\n"
+		fprintf(stderr, "usage: fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-c] [-g] [-f] [-j threads] in out\n"
 				"       fhl d in out\n"
-				"  -t  binary-tree match finder (serial; faster on one core, finds more)\n"
+				"  -c  hash-chain match finder on -j threads instead of the serial\n"
+				"      binary tree (the earlier default; slightly larger streams)\n"
 				"  -g  seed the prices with a greedy parse instead of a flat-priced one\n"
 				"  -f  price every K from one parse and write the most promising\n"
-				"  -t -g -f together: about 2.5x faster for about 0.1%% larger\n");
+				"  -g -f together: about 2x faster for about 0.2%% larger\n");
 		return 1;
 	}
 	size_t n, on;

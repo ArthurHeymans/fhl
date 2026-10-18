@@ -5,7 +5,7 @@ BIN=$1
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 for f in "$(dirname "$0")"/*.bin; do
-	for k in "" "-K 1" "-K 16" "-t -g -f" "-t -K 2"; do
+	for k in "" "-K 1" "-K 16" "-g -f" "-c -K 2"; do
 		# shellcheck disable=SC2086
 		"$BIN" c $k "$f" "$T/c"
 		"$BIN" d "$T/c" "$T/d"

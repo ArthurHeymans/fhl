@@ -1,8 +1,12 @@
 # FHL: firmware Huffman LZ
 
 An LZ77 codec with semi-static Huffman coding, built for decompressing
-firmware stages from SPI flash. It is 4% denser than LZSA2 and decodes faster
-than LZSA2, with a 3.5 KB decoder and no adaptive state.
+firmware stages from SPI flash, with a 3.5 KB decoder and no adaptive state.
+On coreboot stages it is 4% denser than LZSA2 and, on the two Intel cores
+measured (N100, i5-8350U), decodes faster than LZSA2 and coreboot's zstd.
+That lead is CPU-dependent: on a Ryzen 9 8945HS both decode faster than
+FHL, and outside firmware zstd -19 is smaller and faster (see
+[Other data and cores](#other-data-and-cores)).
 
 ## Numbers
 
@@ -17,10 +21,15 @@ on one core, built with gcc `-O2 -march=x86-64-v2`. Decoder size is
 | LZMA (coreboot, lc3) | 1,565,241 | −12.8% | 101.1 ms | 102.4 ms | 3.6 KB | 16 KB |
 | [ANZ](https://github.com/ArthurHeymans/anz) | 1,581,767 | −11.9% | 59.9 ms | 69.1 ms | 2.9 KB | 83 KB |
 | zstd -19 (coreboot decoder) | 1,665,519 | −7.2% | 6.7 ms | 6.7 ms | 41 KB | 96 KB |
-| **FHL** | 1,716,520 | −4.4% | 5.8 ms | 6.5 ms | 3.5 KB | 45 KB |
-| **FHL `-K 1`** | 1,722,404 | −4.1% | **5.6 ms** | **6.3 ms** | 3.5 KB | 45 KB (10 KB used) |
+| **FHL `-c`** | 1,716,520 | −4.4% | 5.8 ms | 6.5 ms | 3.5 KB | 45 KB |
+| **FHL `-c -K 1`** | 1,722,404 | −4.1% | **5.6 ms** | **6.3 ms** | 3.5 KB | 45 KB (10 KB used) |
 | LZSA2, [lzsa2-fast](https://github.com/ArthurHeymans/lzsa2-fast) | 1,795,384 | 0 | 6.4 ms | 6.9 ms | 1.9 KB | 0 |
 | LZSA2, upstream lzsa | 1,795,384 | 0 | 7.1 ms | 7.8 ms | 1.1 KB | 0 |
+
+These FHL streams are from `-c`, the earlier default encoder. The current
+default writes 1,714,883 B (−0.1%); its streams decoded 0.4-1.6% faster than
+the `-c` ones on all three hosts (`gbench`, below), so the times above
+should hold for them too.
 
 I also modelled boot-time load cost as flash read time plus decode time,
 with the decoder's own code read from flash once per board. In that model FHL
@@ -80,12 +89,12 @@ with Huffman prices from the first parse's statistics (more iterations made
 the streams larger). It k-means-clusters the 256 contexts into K tables. The
 flat parse is the same for every K, so it runs once; by default each K then
 gets its own priced parse on its own thread, and the smallest stream wins;
-`-K` picks one. The match finder walks hash chains on `-j` threads, with the
-same matches for any thread count. Three options trade a little size for
-time, together about as fast as `zstd -19`:
+`-K` picks one. Matches come from a binary tree per 3-byte hash (as LZMA's
+bt), which is serial. Options:
 
-- `-t` searches a binary tree per hash (as LZMA's bt) instead of chains:
-  serial, but faster on one core and it finds better matches.
+- `-c` uses hash chains instead, searched on `-j` threads with the same
+  matches for any thread count. This was the default before; it writes
+  the same streams as then, slightly larger than the tree's.
 - `-g` seeds the prices with a lazy greedy parse instead of the flat one.
 - `-f` prices every K from one parse (priced with PARSE_K = 4 tables) and
   writes only the K whose literals estimate smallest.
@@ -101,7 +110,7 @@ size_t n = fhl_decode(src, src_len, dst, dst_cap, work);   /* 0 on a bad header 
 Build with `-DFHL_DECODER_ONLY` to get just `fhl_decode()`.
 
 ```
-make            # fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-t] [-g] [-f] [-j threads] in out
+make            # fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-c] [-g] [-f] [-j threads] in out
 make test       # round trips under ASan/UBSan
 ```
 
@@ -119,22 +128,55 @@ thread.
 | **fhl**, 5 threads | 3.0 | 3.1 | 1.5 |
 
 That table predates the current encoder. Rerun on the Ryzen 9 8945HS, gcc
--O2; the default writes the same streams byte for byte:
+-O2, one thread unless noted:
 
 | encoder | time | bytes |
 |---|---:|---:|
 | zstd -19 | 0.56 s | 1,665,631 |
 | xz `--format=lzma -9e` | 1.56 s | 1,565,605 |
-| `fhl`, 1 thread (before) | 3.81 s | 1,716,520 |
-| `fhl`, 1 thread | 1.43 s | 1,716,520 |
-| `fhl`, 5 threads (before) | 1.51 s | 1,716,520 |
-| `fhl`, 5 threads | 0.75 s | 1,716,520 |
-| `fhl -t`, 1 thread | 1.19 s | 1,714,883 (-0.10%) |
-| `fhl -t -f`, 1 thread | 0.67 s | 1,715,903 (-0.04%) |
-| `fhl -t -g -f`, 1 thread | **0.58 s** | 1,717,830 (+0.08%) |
-| `fhl -t -g -f -d 16`, 1 thread | 0.54 s | 1,719,673 (+0.18%) |
+| `fhl -c` (the earlier default), before this round's speedups | 3.81 s | 1,716,520 |
+| `fhl -c` | 1.38 s | 1,716,520 |
+| `fhl -c`, 5 threads | 0.73 s | 1,716,520 |
+| `fhl` | 1.13 s | 1,714,883 |
+| `fhl`, 5 threads | 0.78 s | 1,714,883 |
+| `fhl -f` | 0.65 s | 1,715,903 |
+| `fhl -g -f` | **0.57 s** | 1,717,830 |
+| `fhl -g -f -d 16` | 0.52 s | 1,719,673 |
 
-`-t` is serial, so threads barely help the last rows.
+The tree match finder is serial, so threads help it less than they help
+`-c`. On the N100 and i5-8350U, `fhl -g -f` takes 0.8-0.9 s and zstd -19
+0.8 s.
+
+## Other data and cores
+
+A second harness, `gbench`, times one-core decode of FHL against stock zstd
+and upstream lzsa, all built with gcc `-O2 -march=x86-64-v2`, in MB/s of
+output (best of 3 runs of at least 20 ms per block). It ranks them as the
+table above does on the N100 and i5-8350U.
+
+Decode MB/s on the coreboot corpus:
+
+| codec | bytes | N100 | i5-8350U | Ryzen 9 8945HS |
+|---|---:|---:|---:|---:|
+| zstd -19 | 1,664,949 | 582 | 525 | **1221** |
+| zstd -19, coreboot's build | 1,664,949 | 577 | 511 | 1193 |
+| `fhl` | 1,714,883 | **653** | **570** | 1103 |
+| upstream LZSA2 | 1,795,384 | 535 | 478 | 1176 |
+
+Decode MB/s on 1 MiB blocks of the [Silesia corpus](https://sun.aei.polsl.pl/~sdeor/corpus/)
+(the first 4 MiB of each of its 12 files, compressed block by block):
+
+| codec | bytes | N100 | i5-8350U | Ryzen 9 8945HS |
+|---|---:|---:|---:|---:|
+| zstd -19 | 18,025,972 | **989** | **907** | **2022** |
+| `fhl` | 18,114,930 | 916 | 817 | 1584 |
+| `fhl -c` | 18,286,558 | 903 | 809 | 1599 |
+| upstream LZSA2 | 20,988,344 | 744 | 691 | 1490 |
+
+So FHL's speed lead over zstd is specific to firmware on these Intel cores.
+On general data zstd -19 is 0.5% smaller and 8-28% faster to decode, and
+encodes at a similar speed (`fhl -g -f` takes 1.1-1.3x zstd -19's time). What
+FHL keeps everywhere is its size: a 3.5 KB decoder against zstd's 41 KB.
 
 ## Limitations
 
@@ -142,7 +184,8 @@ That table predates the current encoder. Rerun on the Ryzen 9 8945HS, gcc
   produced or have verified, for example by hash.
 - It needs the whole output buffer, because literals are staged in its
   tail, so in-place decompression is not possible.
-- There is no stored mode: incompressible data grows by about 0.05%.
+- There is no stored mode: incompressible data grows by about 0.05% and
+  decodes far slower than a stored block would.
 - The window is 1 MiB.
 
 ## License
