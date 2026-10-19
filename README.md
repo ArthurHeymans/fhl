@@ -82,7 +82,7 @@ All multi-byte fields are little-endian, and bitstreams are LSB-first.
 - **Distances:** symbol 0-2 is a rep distance (1 and 2 move to the front).
   Symbol 3+s is slot s: s < 4 gives distance s+1, otherwise
   `((2 | s&1) << nb) + extra + 1` with `nb = s/2 - 1` raw extra bits.
-- Every stream is followed by 8 zero bytes.
+- Every stream is followed by 8 zero bytes, the last one by 16.
 
 The encoder runs a forward optimal parse twice: first with flat prices, then
 with Huffman prices from the first parse's statistics (more iterations made
@@ -108,6 +108,12 @@ size_t n = fhl_decode(src, src_len, dst, dst_cap, work);   /* 0 on a bad header 
 ```
 
 Build with `-DFHL_DECODER_ONLY` to get just `fhl_decode()`.
+
+On 32-bit targets and on targets without fast misaligned loads (RISC-V
+unless GCC reports `__riscv_misaligned_fast`) the decoder reads its
+bitstreams as aligned native words: 30% faster than 8-byte unaligned reads
+for i386 on a Ryzen 9 and 10% on an Atom D410, but 15-20% slower on x86-64.
+`-DFHL_WORD_READS=0` or `=1` overrides the choice.
 
 ```
 make            # fhl c [-K 1|2|4|8|16] [-p passes] [-d depth] [-c] [-g] [-f] [-j threads] in out
